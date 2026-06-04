@@ -1,4 +1,5 @@
-<div align="center">
+
+
 
 # 🤖 微信 ClawBot 管理面板
 
@@ -15,7 +16,7 @@
 
 ## ✨ 功能特性
 
-- 🤖 **多 Bot 管理** — 同时管理多个微信 Bot，扫码登录即用
+- 🤖 **多 Bot 管理** — 同时管理多个微信 clawBot，扫码登录即用
 - 💬 **AI 自动回复** — 接入任意 OpenAI 兼容接口（DeepSeek / OpenAI / DusAPI 等）
 - 🎭 **人设系统** — 可复用的 AI 人设模板库，支持 AI 从聊天记录自动生成人设
 - 📨 **多段发送** — 拟人化将长回复拆分成多条消息，随机间隔模拟真人打字
@@ -27,9 +28,30 @@
 
 ## 🖼️ 截图预览
 
-> 可在此放置项目截图
-
+> 
+后台页面
+<img width="2868" height="1998" alt="image" src="https://github.com/user-attachments/assets/bb299ac2-de9b-4334-b2a5-3cbc286ed4de" /><div align="center">
 ---
+
+自定义模型
+<img width="3502" height="2048" alt="1780554568217" src="https://github.com/user-attachments/assets/e1a3faef-de9f-4021-92fb-3ac8c0228e8d" />
+
+建立人设库
+<img width="3594" height="2042" alt="1780554582353" src="https://github.com/user-attachments/assets/f69cad7f-df20-4685-a24b-91bf0afe1cd8" />
+
+前置提示词，就是用户导入聊天记录的提示词
+<img width="3278" height="2044" alt="1780554627521" src="https://github.com/user-attachments/assets/2443480b-86dc-449a-83f6-92f5ecdc5303" />
+
+新建微信clawbot
+<img width="2526" height="1950" alt="1780554670419" src="https://github.com/user-attachments/assets/53ccf2ac-625c-4b75-a813-fea0ade15472" />
+
+微信扫码即可
+<img width="3600" height="2036" alt="1780554719605" src="https://github.com/user-attachments/assets/dc410a80-b249-4b9b-a972-91c9aed82d56" />
+
+
+微信实例
+<img width="1168" height="1260" alt="image" src="https://github.com/user-attachments/assets/ea90aacf-b042-4470-bccd-8c6a55b31891" />
+
 
 ## 🗂️ 项目结构
 
