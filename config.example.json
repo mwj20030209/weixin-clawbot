@@ -1,0 +1,24 @@
+{
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "your_db_user",
+    "password": "your_db_password",
+    "database": "weixin_clawbot"
+  },
+  "provider": "deepseek",
+  "providers": {
+    "deepseek": {
+      "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat",
+      "prompt": "你是一个友好的AI助手，请用中文简洁地回复。"
+    },
+    "openai": {
+      "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "base_url": "https://api.openai.com",
+      "model": "gpt-4o-mini",
+      "prompt": ""
+    }
+  }
+}

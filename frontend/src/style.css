@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+/* 手机端防止 input focus 触发缩放 */
+@media (max-width: 640px) {
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+}
+
+/* 安全区域适配（刘海屏 / 底部手势条） */
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }

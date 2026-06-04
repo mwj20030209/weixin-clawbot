@@ -1,0 +1,17 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail \"node server.js\" \"cd frontend && npm run dev\"",
+    "start": "node server.js",
+    "dev:front": "cd frontend && npm run dev"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "express": "^4.19.0",
+    "mysql2": "^3.9.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.3"
+  }
+}

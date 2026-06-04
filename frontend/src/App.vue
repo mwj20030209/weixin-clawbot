@@ -1,0 +1,399 @@
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { Plus, Search, Bot as BotIcon, BookOpen, Cpu, Users, LogOut, Sparkles, Menu, X } from 'lucide-vue-next'
+import { apiUrl } from './lib/api'
+import StatCard from './components/StatCard.vue'
+import BotCard, { type Bot, type BotStatus } from './components/BotCard.vue'
+import CreateBotModal from './components/CreateBotModal.vue'
+import QrCodeModal from './components/QrCodeModal.vue'
+import BotDetailDrawer from './components/BotDetailDrawer.vue'
+import PersonasModal from './components/PersonasModal.vue'
+import AIProvidersModal from './components/AIProvidersModal.vue'
+import UsersModal from './components/UsersModal.vue'
+import PromptTemplatesModal from './components/PromptTemplatesModal.vue'
+import LoginPage from './components/LoginPage.vue'
+
+// -------- Auth --------
+const authToken    = ref(localStorage.getItem('clawbot_token') ?? '')
+const authUsername = ref(localStorage.getItem('clawbot_username') ?? '')
+const authRole     = ref(localStorage.getItem('clawbot_role') ?? '')
+const isLoggedIn   = computed(() => !!authToken.value)
+
+function apiFetch(url: string, init: RequestInit = {}) {
+  return fetch(apiUrl(url), {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(authToken.value ? { Authorization: `Bearer ${authToken.value}` } : {}),
+      ...(init.headers as object ?? {}),
+    },
+  })
+}
+
+function handleLogin({ token, username, role }: { token: string; username: string; role: string }) {
+  authToken.value    = token
+  authUsername.value = username
+  authRole.value     = role
+  localStorage.setItem('clawbot_token',    token)
+  localStorage.setItem('clawbot_username', username)
+  localStorage.setItem('clawbot_role',     role)
+}
+
+async function handleLogout() {
+  try { await apiFetch('/api/auth/logout', { method: 'POST' }) } catch {}
+  authToken.value    = ''
+  authUsername.value = ''
+  authRole.value     = ''
+  localStorage.removeItem('clawbot_token')
+  localStorage.removeItem('clawbot_username')
+  localStorage.removeItem('clawbot_role')
+  bots.value = []
+}
+
+async function verifySession() {
+  if (!authToken.value) return
+  try {
+    const res = await apiFetch('/api/auth/me')
+    if (res.status === 401) {
+      authToken.value = ''; authUsername.value = ''; authRole.value = ''
+      localStorage.removeItem('clawbot_token')
+      localStorage.removeItem('clawbot_username')
+      localStorage.removeItem('clawbot_role')
+    }
+  } catch {}
+}
+
+// -------- emoji --------
+const emojiPool = ['🤖','✨','📊','🌍','💻','📝','🦊','🐱','🚀','💡','🎯','🔥']
+function idToEmoji(id: string) {
+  let h = 0
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0
+  return emojiPool[h % emojiPool.length]
+}
+
+function mapStatus(s: string): BotStatus {
+  if (s === 'pending_qr') return 'scanning'
+  if (s === 'offline')    return 'stopped'
+  return s as BotStatus
+}
+
+function fmtDuration(loginTime: number | null): string {
+  if (!loginTime) return '—'
+  const sec = Math.floor((Date.now() - loginTime) / 1000)
+  const h   = Math.floor(sec / 3600)
+  const m   = Math.floor((sec % 3600) / 60)
+  if (h >= 48) return `${Math.floor(h / 24)}d ${h % 24}h`
+  if (h > 0)   return `${h}h ${m}m`
+  return `${m}m`
+}
+
+// -------- 响应式状态 --------
+const bots               = ref<Bot[]>([])
+const query              = ref('')
+const filter             = ref<BotStatus | 'all'>('all')
+const createOpen         = ref(false)
+const qrBot              = ref<Bot | null>(null)
+const detailBot          = ref<Bot | null>(null)
+const personasOpen       = ref(false)
+const aiProvidersOpen    = ref(false)
+const usersOpen          = ref(false)
+const promptTplOpen      = ref(false)
+const menuOpen           = ref(false)   // 手机端汉堡菜单
+
+function openMenu(fn: () => void) {
+  menuOpen.value = false
+  fn()
+}
+
+// -------- API 轮询 --------
+async function fetchBots() {
+  if (!isLoggedIn.value) return
+  try {
+    const res = await apiFetch('/api/bots')
+    if (res.status === 401) { await handleLogout(); return }
+    const raw: any[] = await res.json()
+    bots.value = raw.map(b => ({
+      id:         b.id,
+      name:       b.name,
+      emoji:      idToEmoji(b.id),
+      status:     mapStatus(b.status),
+      persona:    b.persona || '（未设置人设）',
+      onlineTime: fmtDuration(b.loginTime),
+      qrcodeUrl:  b.qrcodeUrl ?? null,
+    }))
+    if (qrBot.value) {
+      const live = bots.value.find(b => b.id === qrBot.value!.id)
+      if (live?.status === 'active') setTimeout(() => { qrBot.value = null }, 1200)
+      else if (live) qrBot.value = { ...live }
+    }
+  } catch {}
+}
+
+let pollTimer: ReturnType<typeof setInterval>
+onMounted(async () => {
+  await verifySession()
+  fetchBots()
+  pollTimer = setInterval(fetchBots, 2000)
+})
+onUnmounted(() => clearInterval(pollTimer))
+
+// -------- 统计 --------
+const stats = computed(() => ({
+  total:    bots.value.length,
+  active:   bots.value.filter(b => b.status === 'active').length,
+  scanning: bots.value.filter(b => b.status === 'scanning' || b.status === 'reconnecting').length,
+  stopped:  bots.value.filter(b => b.status === 'stopped'  || b.status === 'expired').length,
+}))
+
+const filtered = computed(() => bots.value.filter(b => {
+  const q = query.value.trim().toLowerCase()
+  if (q && !b.name.toLowerCase().includes(q) && !b.persona.toLowerCase().includes(q)) return false
+  if (filter.value !== 'all' && b.status !== filter.value) return false
+  return true
+}))
+
+// -------- 操作 --------
+async function handleCreate({ name, persona, personaId, gender }: { name: string; persona: string; personaId: number | null; gender: string }) {
+  const res  = await apiFetch('/api/bots', {
+    method: 'POST',
+    body: JSON.stringify({ name, persona, personaId, gender }),
+  })
+  const data = await res.json()
+  if (!res.ok) { alert(data.error ?? '创建失败'); return }
+  createOpen.value = false
+  await fetchBots()
+  const newBot = bots.value.find(b => b.id === data.id)
+  if (newBot) setTimeout(() => { qrBot.value = { ...newBot, qrcodeUrl: data.qrcodeUrl } }, 200)
+}
+
+async function handleRestart(bot: Bot) {
+  await apiFetch(`/api/bots/${bot.id}/reconnect`, { method: 'POST' })
+  await fetchBots()
+  const live = bots.value.find(b => b.id === bot.id)
+  if (live?.qrcodeUrl) qrBot.value = { ...live }
+}
+
+async function handleDelete(bot: Bot) {
+  if (!confirm(`确定要删除 Bot「${bot.name}」吗？`)) return
+  await apiFetch(`/api/bots/${bot.id}`, { method: 'DELETE' })
+  if (qrBot.value?.id    === bot.id) qrBot.value    = null
+  if (detailBot.value?.id === bot.id) detailBot.value = null
+  await fetchBots()
+}
+
+async function handleSave({ id, persona }: { id: string; persona: string }) {
+  bots.value = bots.value.map(b => b.id === id ? { ...b, persona } : b)
+}
+</script>
+
+<template>
+  <LoginPage v-if="!isLoggedIn" @login="handleLogin" />
+
+  <div v-else class="min-h-screen w-full bg-[#F7F8FA]"
+    style='font-family:"Microsoft YaHei","PingFang SC",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1D2129;'>
+
+    <!-- ===== Header ===== -->
+    <header class="sticky top-0 z-30 bg-white/90 backdrop-blur border-b border-[#F2F3F5]">
+      <div class="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-10 h-[56px] flex items-center justify-between gap-2">
+
+        <!-- Logo -->
+        <div class="flex items-center gap-2 shrink-0">
+          <div class="w-8 h-8 rounded-[9px] flex items-center justify-center text-white"
+               style="background:linear-gradient(135deg,#4080FF,#5B8DEF)">
+            <BotIcon :size="16" />
+          </div>
+          <div class="hidden xs:block">
+            <div class="text-[14px] font-medium" style="color:#1D2129">微信 ClawBot</div>
+            <div class="text-[11px] text-[#86909C] -mt-0.5 hidden sm:block">多 Bot 管理面板</div>
+          </div>
+        </div>
+
+        <!-- 桌面端：管理按钮组 (sm+) -->
+        <div v-if="authRole === 'admin'" class="hidden sm:flex items-center gap-1.5">
+          <button class="lib-btn" @click="usersOpen = true">
+            <Users :size="14" /> 用户管理
+          </button>
+          <button class="lib-btn" @click="aiProvidersOpen = true">
+            <Cpu :size="14" /> AI 配置
+          </button>
+          <button class="lib-btn" @click="personasOpen = true">
+            <BookOpen :size="14" /> 人设库
+          </button>
+          <button class="lib-btn" @click="promptTplOpen = true">
+            <Sparkles :size="14" /> 提示词库
+          </button>
+        </div>
+
+        <!-- 右侧：用户信息 + 操作 -->
+        <div class="flex items-center gap-1.5 shrink-0">
+          <!-- 用户名 + 角色（仅 sm+ 显示用户名） -->
+          <span class="hidden sm:inline text-[13px] text-[#4E5969]">{{ authUsername }}</span>
+          <span class="role-tag" :class="authRole">{{ authRole === 'admin' ? '管理员' : '用户' }}</span>
+
+          <!-- 手机端汉堡菜单按钮（admin 才显示） -->
+          <button v-if="authRole === 'admin'"
+            class="menu-btn sm:hidden"
+            @click="menuOpen = !menuOpen">
+            <X v-if="menuOpen" :size="18" />
+            <Menu v-else :size="18" />
+          </button>
+
+          <!-- 登出 -->
+          <button class="logout-btn" title="退出登录" @click="handleLogout">
+            <LogOut :size="15" />
+          </button>
+        </div>
+      </div>
+
+      <!-- 手机端下拉菜单 -->
+      <Transition name="menu-drop">
+        <div v-if="menuOpen && authRole === 'admin'"
+          class="sm:hidden border-t border-[#F2F3F5] bg-white px-4 py-3 grid grid-cols-2 gap-2">
+          <button class="mobile-menu-item" @click="openMenu(() => usersOpen = true)">
+            <Users :size="16" style="color:#4080FF" />
+            <span>用户管理</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => aiProvidersOpen = true)">
+            <Cpu :size="16" style="color:#4080FF" />
+            <span>AI 配置</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => personasOpen = true)">
+            <BookOpen :size="16" style="color:#4080FF" />
+            <span>人设库</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => promptTplOpen = true)">
+            <Sparkles :size="16" style="color:#7B61FF" />
+            <span>提示词库</span>
+          </button>
+        </div>
+      </Transition>
+    </header>
+
+    <!-- ===== Main ===== -->
+    <main class="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-10 py-5 sm:py-8">
+
+      <!-- 统计卡片 -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <StatCard variant="total"    :value="stats.total" />
+        <StatCard variant="active"   :value="stats.active" />
+        <StatCard variant="scanning" :value="stats.scanning" />
+        <StatCard variant="stopped"  :value="stats.stopped" />
+      </div>
+
+      <!-- 工具栏 -->
+      <div class="mt-5 sm:mt-6 flex flex-col sm:flex-row gap-2.5 sm:items-center">
+        <!-- 搜索框 -->
+        <div class="relative w-full sm:flex-1 sm:max-w-[400px]">
+          <Search :size="15" class="absolute left-3 top-1/2 -translate-y-1/2 text-[#86909C]" />
+          <input v-model="query" placeholder="搜索 Bot 名称或人设…"
+            class="toolbar-input w-full" style="padding-left:34px;" />
+        </div>
+        <!-- 筛选 -->
+        <select v-model="filter" class="toolbar-input w-full sm:w-[150px]">
+          <option value="all">全部状态</option>
+          <option value="active">运行中</option>
+          <option value="scanning">等待扫码</option>
+          <option value="reconnecting">重连中</option>
+          <option value="expired">已过期</option>
+          <option value="stopped">已停止</option>
+        </select>
+        <!-- 新建按钮 -->
+        <button class="new-btn w-full sm:w-auto" @click="createOpen = true">
+          <Plus :size="16" /> 新建 Bot
+        </button>
+      </div>
+
+      <!-- Bot 列表 -->
+      <div class="mt-5 sm:mt-6">
+        <div v-if="filtered.length === 0"
+          class="bg-white rounded-[12px] border border-[#F2F3F5] py-20 text-center">
+          <div style="color:#1D2129">没有找到匹配的 Bot</div>
+          <div class="text-[13px] text-[#86909C] mt-1">尝试调整搜索关键词或筛选条件</div>
+        </div>
+        <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
+          <BotCard
+            v-for="b in filtered" :key="b.id" :bot="b"
+            @view="detailBot = $event"
+            @restart="handleRestart"
+            @delete="handleDelete"
+          />
+        </div>
+      </div>
+    </main>
+
+    <!-- ===== Modals ===== -->
+    <PersonasModal       :open="personasOpen"    @update:open="personasOpen = $event" />
+    <AIProvidersModal    :open="aiProvidersOpen" @update:open="aiProvidersOpen = $event" />
+    <UsersModal          :open="usersOpen"       :token="authToken" @update:open="usersOpen = $event" />
+    <PromptTemplatesModal :open="promptTplOpen"  :token="authToken" @update:open="promptTplOpen = $event" />
+    <CreateBotModal      :open="createOpen"      :token="authToken"
+      @update:open="createOpen = $event" @create="handleCreate" />
+    <QrCodeModal         :open="!!qrBot"         :bot="qrBot"
+      @update:open="(v) => !v && (qrBot = null)" @refresh="() => {}" />
+    <BotDetailDrawer     :open="!!detailBot"     :bot="detailBot"  :token="authToken"
+      @update:open="(v) => !v && (detailBot = null)" @save="handleSave" />
+  </div>
+</template>
+
+<style scoped>
+.toolbar-input {
+  height:40px; padding:0 12px;
+  background:#fff; border:1px solid #E5E6EB; border-radius:10px;
+  font-size:14px; color:#1D2129; outline:none;
+  transition:border-color .15s,box-shadow .15s;
+}
+.toolbar-input:focus { border-color:#4080FF; box-shadow:0 0 0 3px rgba(64,128,255,.15); }
+
+.lib-btn {
+  height:34px; padding:0 12px; border-radius:8px;
+  background:#F7F8FA; color:#4E5969;
+  border:1px solid #E5E6EB; cursor:pointer;
+  display:inline-flex; align-items:center; gap:5px;
+  font-size:13px; white-space:nowrap; transition:all .15s;
+}
+.lib-btn:hover { background:#EEF3FF; color:#4080FF; border-color:#C2D4FF; }
+
+.new-btn {
+  height:40px; padding:0 18px; border-radius:10px;
+  background:#4080FF; color:#fff; border:none; cursor:pointer;
+  display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  font-size:14px; font-weight:500;
+  box-shadow:0 4px 14px rgba(64,128,255,.28);
+  transition:background .15s,transform .1s;
+}
+.new-btn:hover  { background:#2D6FED; }
+.new-btn:active { transform:translateY(1px); }
+
+.role-tag {
+  font-size:11px; font-weight:500; padding:2px 8px; border-radius:20px; white-space:nowrap;
+}
+.role-tag.admin { background:rgba(64,128,255,.12); color:#4080FF; }
+.role-tag.user  { background:rgba(134,144,156,.12); color:#86909C; }
+
+.logout-btn {
+  width:32px; height:32px; border-radius:8px; background:transparent; border:none;
+  cursor:pointer; display:flex; align-items:center; justify-content:center;
+  color:#86909C; transition:all .15s; flex-shrink:0;
+}
+.logout-btn:hover { background:#FFF0EE; color:#F53F3F; }
+
+.menu-btn {
+  width:32px; height:32px; border-radius:8px; background:transparent; border:none;
+  cursor:pointer; display:flex; align-items:center; justify-content:center;
+  color:#4E5969; transition:all .15s;
+}
+.menu-btn:hover { background:#F2F3F5; }
+
+.mobile-menu-item {
+  display:flex; align-items:center; gap:8px; padding:10px 14px;
+  border-radius:10px; background:#F7F8FA; border:1px solid #F0F1F3;
+  cursor:pointer; font-size:14px; color:#1D2129;
+  transition:all .15s;
+}
+.mobile-menu-item:hover { background:#EEF3FF; border-color:#C2D4FF; }
+.mobile-menu-item:active { transform:scale(.97); }
+
+/* 汉堡菜单动画 */
+.menu-drop-enter-active,.menu-drop-leave-active { transition:all .2s ease; }
+.menu-drop-enter-from,.menu-drop-leave-to { opacity:0; transform:translateY(-8px); }
+</style>
