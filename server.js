@@ -2,6 +2,7 @@ import fs from 'fs'
 import express from 'express'
 import mysql from 'mysql2/promise'
 import bcrypt from 'bcryptjs'
+import cron from 'node-cron'
 import { randomUUID, createSign, randomBytes, createDecipheriv, createHash } from 'crypto'
 import { fileURLToPath } from 'url'
 import path from 'path'
@@ -53,10 +54,10 @@ const RECONNECT_CONFIG = {
 const COMMANDS_MSG = [
   '连接成功！',
   '可用指令：',
-  '/help  /指令   - 查看全部指令列表',
-  '/time          - 查询当前连接剩余时间',
-  '/重新连接       - 立即触发重新连接（需确认）',
-  '',
+  '/额度 -查询聊天额度',
+  '/剩余时间 -查询当前连接剩余时间',
+  '/重新连接   -立即重新连接',
+  '/官网 -官方网站',
   '非指令输入即为 AI 对话',
 ].join('\n')
 
@@ -308,6 +309,62 @@ async function initDB() {
     console.log('[DB] 系统配置表初始化完成')
   } catch (e) { console.log('[DB] 系统配置表初始化失败:', e.message) }
 
+  // 微信支付配置表
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS wx_pay_configs (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      name       VARCHAR(100) NOT NULL,
+      app_id     VARCHAR(64)  NOT NULL DEFAULT '',
+      app_secret VARCHAR(128) NOT NULL DEFAULT '',
+      mch_id     VARCHAR(32)  NOT NULL DEFAULT '',
+      mch_key    VARCHAR(128) NOT NULL DEFAULT '',
+      key_path   VARCHAR(255) NOT NULL DEFAULT '',
+      notify_url VARCHAR(255) NOT NULL DEFAULT '',
+      is_active  TINYINT(1)   NOT NULL DEFAULT 0,
+      created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    console.log('[DB] 微信支付配置表初始化完成')
+  } catch (e) { console.log('[DB] 微信支付配置表初始化失败:', e.message) }
+
+  // 用户会话表（用于主动推送）
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS user_sessions (
+      bot_id        VARCHAR(64)  NOT NULL,
+      from_id       VARCHAR(128) NOT NULL,
+      context_token VARCHAR(256) NOT NULL,
+      last_seen     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (bot_id, from_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    console.log('[DB] 用户会话表初始化完成')
+  } catch (e) { console.log('[DB] 用户会话表初始化失败:', e.message) }
+
+  // 定时消息表
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS scheduled_messages (
+      id          INT AUTO_INCREMENT PRIMARY KEY,
+      name        VARCHAR(100) NOT NULL,
+      send_time   VARCHAR(5)   NOT NULL COMMENT 'HH:MM 格式',
+      message     TEXT         NOT NULL,
+      target_bot  VARCHAR(64)  NULL     COMMENT 'NULL=所有Bot',
+      is_active   TINYINT(1)   NOT NULL DEFAULT 1,
+      created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    console.log('[DB] 定时消息表初始化完成')
+  } catch (e) { console.log('[DB] 定时消息表初始化失败:', e.message) }
+
+  // scheduled_messages 列迁移（use_ai / ai_prompt / time_window）
+  try {
+    const [cols] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='scheduled_messages' AND COLUMN_NAME='use_ai'`)
+    if (cols.length === 0) {
+      await db.query(`ALTER TABLE scheduled_messages
+        ADD COLUMN use_ai      TINYINT(1) NOT NULL DEFAULT 0,
+        ADD COLUMN ai_prompt   TEXT       NULL,
+        ADD COLUMN time_window INT        NOT NULL DEFAULT 0 COMMENT '随机窗口(分钟),0=精确时间'`)
+      console.log('[DB] scheduled_messages 列迁移完成')
+    }
+  } catch (e) { console.log('[DB] scheduled_messages 列迁移失败:', e.message) }
+
   // users: openid
   try {
     const [r] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='openid'`)
@@ -324,6 +381,42 @@ async function initDB() {
   } catch {}
 
   console.log('[DB] 初始化完成')
+}
+
+// ========== 记忆与人设进化表 ==========
+// 在 initDB 后单独异步创建，避免干扰主初始化
+async function initMemoryTables() {
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS tb_base_role (
+      id          INT AUTO_INCREMENT PRIMARY KEY,
+      bot_id      VARCHAR(64)  NOT NULL,
+      user_id     VARCHAR(128) NOT NULL,
+      base_prompt TEXT         NOT NULL,
+      last_update DATE         NULL,
+      UNIQUE KEY uk_bot_user (bot_id, user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+
+    await db.query(`CREATE TABLE IF NOT EXISTS tb_long_memory (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      bot_id     VARCHAR(64)  NOT NULL,
+      user_id    VARCHAR(128) NOT NULL,
+      content    VARCHAR(500) NOT NULL,
+      created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_bu (bot_id, user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+
+    await db.query(`CREATE TABLE IF NOT EXISTS tb_chat_record (
+      id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+      bot_id     VARCHAR(64)  NOT NULL,
+      user_id    VARCHAR(128) NOT NULL,
+      role       VARCHAR(16)  NOT NULL,
+      content    TEXT         NOT NULL,
+      created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_bu_time (bot_id, user_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+
+    console.log('[DB] 记忆表初始化完成')
+  } catch (e) { console.log('[DB] 记忆表初始化失败:', e.message) }
 }
 
 async function dbGetBots() {
@@ -548,6 +641,50 @@ async function dbSetActiveProvider(id) {
   _aiProviderCache = null  // 清缓存，下次调用重新读取
 }
 
+// ========== 微信支付配置 CRUD ==========
+let _wxPayConfigCache = null
+let _wxPayConfigCacheExp = 0
+
+async function dbGetWxPayConfigs() {
+  const [rows] = await db.query(
+    'SELECT id, name, app_id, mch_id, key_path, notify_url, is_active, created_at FROM wx_pay_configs ORDER BY id ASC'
+  )
+  return rows
+}
+async function dbCreateWxPayConfig(name, appId, appSecret, mchId, mchKey, keyPath, notifyUrl) {
+  const [r] = await db.query(
+    'INSERT INTO wx_pay_configs (name, app_id, app_secret, mch_id, mch_key, key_path, notify_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [name, appId, appSecret, mchId, mchKey, keyPath, notifyUrl]
+  )
+  _wxPayConfigCache = null
+  return r.insertId
+}
+async function dbUpdateWxPayConfig(id, name, appId, appSecret, mchId, mchKey, keyPath, notifyUrl) {
+  if (mchKey && mchKey.trim()) {
+    await db.query(
+      'UPDATE wx_pay_configs SET name=?, app_id=?, app_secret=?, mch_id=?, mch_key=?, key_path=?, notify_url=? WHERE id=?',
+      [name, appId, appSecret, mchId, mchKey, keyPath, notifyUrl, id]
+    )
+  } else {
+    await db.query(
+      'UPDATE wx_pay_configs SET name=?, app_id=?, app_secret=?, mch_id=?, key_path=?, notify_url=? WHERE id=?',
+      [name, appId, appSecret, mchId, keyPath, notifyUrl, id]
+    )
+  }
+  _wxPayConfigCache = null
+}
+async function dbDeleteWxPayConfig(id) {
+  const [rows] = await db.query('SELECT is_active FROM wx_pay_configs WHERE id = ?', [id])
+  if (!rows[0]) throw new Error('配置不存在')
+  if (rows[0].is_active) throw new Error('不能删除当前使用中的配置，请先切换到其他配置')
+  await db.query('DELETE FROM wx_pay_configs WHERE id = ?', [id])
+}
+async function dbSetActiveWxPayConfig(id) {
+  await db.query('UPDATE wx_pay_configs SET is_active = 0')
+  await db.query('UPDATE wx_pay_configs SET is_active = 1 WHERE id = ?', [id])
+  _wxPayConfigCache = null
+}
+
 // ========== 系统配置 ==========
 async function dbGetSystemConfig(key) {
   try {
@@ -610,6 +747,175 @@ async function dbAddQuota(userId, delta) {
 }
 async function dbDeductQuota(userId, count) {
   await db.query('UPDATE users SET quota = GREATEST(0, quota - ?) WHERE id = ?', [count, userId])
+}
+
+// ========== 用户会话（主动推送） ==========
+async function dbUpsertUserSession(botId, fromId, contextToken) {
+  await db.query(
+    `INSERT INTO user_sessions (bot_id, from_id, context_token) VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE context_token = VALUES(context_token), last_seen = NOW()`,
+    [botId, fromId, contextToken]
+  )
+}
+async function dbGetUserSessions(botId = null, sinceHours = 72) {
+  // 获取最近 N 小时内有过对话的用户
+  if (botId) {
+    const [rows] = await db.query(
+      `SELECT bot_id, from_id, context_token FROM user_sessions WHERE bot_id = ? AND last_seen > DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+      [botId, sinceHours]
+    )
+    return rows
+  }
+  const [rows] = await db.query(
+    `SELECT bot_id, from_id, context_token FROM user_sessions WHERE last_seen > DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+    [sinceHours]
+  )
+  return rows
+}
+
+// ========== 定时消息 ==========
+async function dbGetScheduledMessages(onlyActive = false) {
+  const [rows] = await db.query(
+    onlyActive
+      ? 'SELECT * FROM scheduled_messages WHERE is_active = 1 ORDER BY send_time ASC'
+      : 'SELECT * FROM scheduled_messages ORDER BY send_time ASC'
+  )
+  return rows
+}
+async function dbCreateScheduledMsg(name, sendTime, message, targetBot, useAi, aiPrompt, timeWindow) {
+  const [r] = await db.query(
+    'INSERT INTO scheduled_messages (name, send_time, message, target_bot, use_ai, ai_prompt, time_window) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [name, sendTime, message || '', targetBot || null, useAi ? 1 : 0, aiPrompt || null, timeWindow || 0]
+  )
+  return r.insertId
+}
+async function dbUpdateScheduledMsg(id, name, sendTime, message, targetBot, isActive, useAi, aiPrompt, timeWindow) {
+  await db.query(
+    'UPDATE scheduled_messages SET name=?, send_time=?, message=?, target_bot=?, is_active=?, use_ai=?, ai_prompt=?, time_window=? WHERE id=?',
+    [name, sendTime, message || '', targetBot || null, isActive ? 1 : 0, useAi ? 1 : 0, aiPrompt || null, timeWindow || 0, id]
+  )
+}
+async function dbDeleteScheduledMsg(id) {
+  await db.query('DELETE FROM scheduled_messages WHERE id=?', [id])
+}
+
+// ========== 记忆与人设 DB 函数 ==========
+
+// --- tb_base_role ---
+async function dbGetBaseRole(botId, userId) {
+  const [rows] = await db.query('SELECT * FROM tb_base_role WHERE bot_id=? AND user_id=?', [botId, userId])
+  return rows[0] ?? null
+}
+async function dbInitBaseRole(botId, userId) {
+  await db.query(
+    'INSERT IGNORE INTO tb_base_role (bot_id, user_id, base_prompt) VALUES (?, ?, ?)',
+    [botId, userId, '']
+  )
+  return await dbGetBaseRole(botId, userId)
+}
+async function dbAppendBaseRole(botId, userId, text) {
+  await db.query(
+    'UPDATE tb_base_role SET base_prompt=CONCAT(base_prompt, ?) WHERE bot_id=? AND user_id=?',
+    [text, botId, userId]
+  )
+}
+async function dbSetBaseRole(botId, userId, text) {
+  await db.query(
+    'UPDATE tb_base_role SET base_prompt=? WHERE bot_id=? AND user_id=?',
+    [text, botId, userId]
+  )
+}
+
+// --- tb_long_memory ---
+async function dbInsertLongMemory(botId, userId, content) {
+  await db.query(
+    'INSERT INTO tb_long_memory (bot_id, user_id, content) VALUES (?, ?, ?)',
+    [botId, userId, content.slice(0, 500)]
+  )
+}
+async function dbSearchLongMemory(botId, userId, keyword) {
+  const kw = '%' + (keyword || '').slice(0, 30).replace(/%/g, '\\%').replace(/_/g, '\\_') + '%'
+  const [rows] = await db.query(
+    'SELECT id, content, created_at FROM tb_long_memory WHERE bot_id=? AND user_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT 5',
+    [botId, userId, kw]
+  )
+  // 沒匹配则取最新 5 条
+  if (rows.length === 0) {
+    const [all] = await db.query(
+      'SELECT id, content, created_at FROM tb_long_memory WHERE bot_id=? AND user_id=? ORDER BY created_at DESC LIMIT 5',
+      [botId, userId]
+    )
+    return all
+  }
+  return rows
+}
+async function dbGetAllLongMemory(botId, userId) {
+  const [rows] = await db.query(
+    'SELECT id, content, created_at FROM tb_long_memory WHERE bot_id=? AND user_id=? ORDER BY created_at DESC',
+    [botId, userId]
+  )
+  return rows
+}
+async function dbDeleteLongMemory(id) {
+  await db.query('DELETE FROM tb_long_memory WHERE id=?', [id])
+}
+
+// --- tb_chat_record ---
+async function dbAppendChatRecord(botId, userId, role, content) {
+  await db.query(
+    'INSERT INTO tb_chat_record (bot_id, user_id, role, content) VALUES (?, ?, ?, ?)',
+    [botId, userId, role, content]
+  )
+}
+async function dbGetWeeklyChatRecord(botId, userId, since) {
+  const [rows] = await db.query(
+    'SELECT role, content FROM tb_chat_record WHERE bot_id=? AND user_id=? AND created_at>? ORDER BY created_at ASC',
+    [botId, userId, since]
+  )
+  return rows
+}
+
+// ========== 独立 AI 调用（定时推送 / 重连提示复用） ==========
+async function callAI(systemPrompt, userMessage, maxTokens = 300) {
+  const aiCfg = await dbGetActiveProvider()
+  if (!aiCfg) throw new Error('未配置AI提供商')
+  const res = await fetch(`${aiCfg.base_url}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${aiCfg.api_key}` },
+    body: JSON.stringify({
+      model: aiCfg.model, max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userMessage   },
+      ],
+    }),
+  }).then(r => r.json())
+
+  // 如果 API 返回了错误字段，直接抛出可读信息
+  if (res?.error) {
+    const errMsg = res.error.message || JSON.stringify(res.error)
+    console.error('[callAI] API 返回错误:', errMsg, '| model:', aiCfg.model, '| base_url:', aiCfg.base_url)
+    throw new Error(`API错误: ${errMsg}`)
+  }
+
+  const text = res?.choices?.[0]?.message?.content?.trim()
+  if (!text) {
+    // 打印完整响应便于诊断
+    console.error('[callAI] 未获取到有效内容，完整响应:', JSON.stringify(res).slice(0, 500))
+    throw new Error('AI未返回有效内容')
+  }
+  return text
+}
+
+// 基于 msgId+日期 hash，在 [sendTime, sendTime+timeWindow分钟] 内确定性随机返回踦点
+function getTodayFireMinute(msgId, sendTime, timeWindow) {
+  const [h, m] = sendTime.split(':').map(Number)
+  const baseMins = h * 60 + m
+  if (!timeWindow || timeWindow <= 0) return baseMins
+  const today = new Date().toISOString().slice(0, 10)
+  const hash  = createHash('md5').update(`sched-${msgId}-${today}`).digest('hex')
+  const offset = parseInt(hash.slice(0, 8), 16) % timeWindow
+  return baseMins + offset
 }
 
 // ========== BotInstance ==========
@@ -759,6 +1065,33 @@ class BotInstance {
     } catch (e) { console.log(`[${this.name}] 发送失败: ${e?.message}`) }
   }
 
+  // 用 AI 生成符合人设的重连警告
+  async generateReconnectWarning(remaining) {
+    const h = Math.floor(remaining / 3600)
+    const m = Math.floor((remaining % 3600) / 60)
+    const timeStr = h > 0 ? `${h}小时${m}分钟` : `${m}分钟`
+    try {
+      const aiCfg = await dbGetActiveProvider()
+      if (!aiCfg) return null
+      // 构建人设 context（与正常对话一致）
+      const parts = [BASE_PERSONA]
+      const genderLabel = this.gender === 'female' ? '女性' : this.gender === 'male' ? '男性' : ''
+      if (genderLabel) parts.push(`你扮演的是一个${genderLabel}。`)
+      if (this.personaId && !this._personaCache) this._personaCache = await dbGetPersona(this.personaId)
+      if (this._personaCache) parts.push('[人设模板]\n' + this._personaCache.content)
+      else if (this.persona) parts.push('[自定义人设]\n' + this.persona)
+      const warning = await callAI(
+        parts.join('\n'),
+        `我们的连接还有${timeStr}就要断开了。请以你的性格，用自然温柔的方式提醒用户连接快到期，引导他们回复 Y 保持连接或 N 稍后提醒，不超过80字，不要生硬。`,
+        150
+      )
+      return warning
+    } catch (e) {
+      console.log(`[${this.name}] 生成重连提示失败:`, e.message)
+      return null
+    }
+  }
+
   async messageLoop() {
     console.log(`[${this.name}] 开始监听消息... baseUrl=${this.baseUrl}`)
     while (!this.stopped) {
@@ -799,6 +1132,9 @@ class BotInstance {
           const contextToken = msg.context_token
           console.log(`[${this.name}] 收到: itemType=${itemType} text=${text}`)
           this.lastContact  = { fromId, contextToken }
+
+          // 保存用户会话（用于定时推送）
+          dbUpsertUserSession(this.id, fromId, contextToken).catch(() => {})
 
           // 语音消息 → 直接提示
           if (itemType === 3) {
@@ -849,7 +1185,7 @@ class BotInstance {
             await this.sendMsgSafe(fromId, contextToken, COMMANDS_MSG); continue
           }
 
-          if (text?.trim() === '/time') {
+          if (text?.trim() === '/time' || text?.trim() === '/剩余时间') {
             const rem = Math.max(0, (this.loginTime + RECONNECT_CONFIG.session_duration * 1000 - Date.now()) / 1000)
             const h = Math.floor(rem / 3600), m = Math.floor((rem % 3600) / 60)
             await this.sendMsgSafe(fromId, contextToken,
@@ -864,6 +1200,28 @@ class BotInstance {
               this.manualReconnectPending.add(fromId)
               await this.sendMsgSafe(fromId, contextToken, '确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消')
             }
+            continue
+          }
+          
+          // /额度 - 查询当前额度
+          if (text?.trim() === '/额度') {
+            if (this.createdBy) {
+              try {
+                const [_qr] = await db.query('SELECT quota FROM users WHERE id = ?', [this.createdBy])
+                const quota = _qr[0]?.quota ?? 0
+                await this.sendMsgSafe(fromId, contextToken, `💬 您当前剩余聊天额度：${quota} 条`)
+              } catch (e) {
+                await this.sendMsgSafe(fromId, contextToken, '查询额度失败，请稍后重试')
+              }
+            } else {
+              await this.sendMsgSafe(fromId, contextToken, '此 Bot 未绑定用户账号，无法查询额度')
+            }
+            continue
+          }
+          
+          // /官网 - 显示官网链接
+          if (text?.trim() === '/官网') {
+            await this.sendMsgSafe(fromId, contextToken, '🌐 官方网站：https://wxhot.xmhwl.cn')
             continue
           }
 
@@ -929,19 +1287,45 @@ class BotInstance {
             if (tpl)            parts.push('\n【人设模板】\n' + tpl.content)
             if (this.persona)   parts.push('\n【自定义补充】\n' + this.persona)
             if (!tpl && !this.persona) parts.push('\n【角色设定】\n' + (aiCfg.prompt || DEFAULT_PROMPT))
+
+            // 加载用户专属成长人设（第一段末尾追加）
+            const baseRole = await dbInitBaseRole(this.id, fromId)
+            if (baseRole?.base_prompt) parts.push('\n【专属成长记忆】\n' + baseRole.base_prompt)
+
+            // === 第二段：长期记忆（关键词匹配，最多5条） ===
+            const keyword = (text || '').slice(0, 20)
+            const memories = await dbSearchLongMemory(this.id, fromId, keyword)
+            if (memories.length > 0) {
+              parts.push('\n【关于TA的记忆】\n' + memories.map(m => '- ' + m.content).join('\n'))
+            }
+
             const systemPrompt = parts.join('\n')
+
+            // === 第三段：短时上下文 + Token 阈值检查 ===
+            const ctx = [...this.userHistories[fromId]]
+            const totalLen = systemPrompt.length + ctx.reduce((s, m) => s + m.content.length, 0)
+            if (totalLen > 2800 && ctx.length > 8) {
+              const old = ctx.splice(0, 4)
+              callAI('用一句话总结下面对话的关键信息：', old.map(m => m.content).join('\n'), 80)
+                .then(summary => { if (summary) dbInsertLongMemory(this.id, fromId, '[对话摘要] ' + summary).catch(() => {}) })
+                .catch(() => {})
+            }
+
             const aiRes = await fetch(`${aiCfg.base_url}/v1/chat/completions`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${aiCfg.api_key}` },
               body: JSON.stringify({
                 model: aiCfg.model,
-                messages: [{ role: 'system', content: systemPrompt }, ...this.userHistories[fromId]],
+                messages: [{ role: 'system', content: systemPrompt }, ...ctx],
               }),
             }).then(r => r.json())
             reply = aiRes?.choices?.[0]?.message?.content?.trim() || 'AI 未返回有效内容'
             if (aiRes?.choices?.[0]?.message) {
               this.userHistories[fromId].push({ role: 'assistant', content: reply })
               await dbAppendHistory(this.id, fromId, 'assistant', reply)
+              // 写全量记录（异步）
+              dbAppendChatRecord(this.id, fromId, 'user', text).catch(() => {})
+              dbAppendChatRecord(this.id, fromId, 'assistant', reply).catch(() => {})
             }
           } catch (err) { console.error(`[${this.name}] AI 失败:`, err.message) }
 
@@ -973,7 +1357,22 @@ class BotInstance {
               await db.query('UPDATE users SET quota = GREATEST(0, quota - ?) WHERE id = ?', [segments.length, this.createdBy])
             } catch (e) { console.log(`[${this.name}] 额度扣除失败: ${e.message}`) }
           }
-        }
+
+          // 非阻塞：提取本轮对话信息存入长期记忆
+          ;(async () => {
+            try {
+              const extraction = await callAI(
+                '你是信息提取助手，只提取事实，不发挥。',
+                `从下面对话中提取用户的：生日、爱好、作息习惯、专属昵称、重要纪念日。无则返回空文本。\n用户说：${text}\nAI回复：${reply}`,
+                100
+              )
+              if (extraction && extraction.trim() && extraction.trim() !== '无' && extraction.length > 3) {
+                await dbInsertLongMemory(this.id, fromId, extraction.trim())
+                console.log(`[${this.name}] 记忆入库: ${extraction.trim().slice(0, 30)}`)
+              }
+            } catch {}
+          })()
+        } // end if (text)
       } catch (e) {
         if (!this.stopped) {
           console.log(`[${this.name}] 消息循环异常: ${e?.message} (baseUrl=${this.baseUrl})`)
@@ -1045,12 +1444,15 @@ class BotInstance {
 
       let remaining = (this.loginTime + RECONNECT_CONFIG.session_duration * 1000 - Date.now()) / 1000
       if (remaining <= RECONNECT_CONFIG.force_before) {
-        await this.sendMsgSafe(this.lastContact.fromId, this.lastContact.contextToken, '[自动] 连接即将到期，开始强制重新连接...')
-        await this.doReconnect(); continue
+        await this.sendMsgSafe(this.lastContact.fromId, this.lastContact.contextToken,
+        `[自动] 连接即将到期，开始强制重新连接...`)
+      await this.doReconnect(); continue
       }
 
-      await this.sendMsgSafe(this.lastContact.fromId, this.lastContact.contextToken,
-        `[提醒] 连接还剩约 ${(remaining / 3600).toFixed(1)} 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒`)
+      // AI 生成第一次提醒
+      const warn1 = await this.generateReconnectWarning(remaining) ||
+        `[提醒] 连接还剩约 ${(remaining / 3600).toFixed(1)} 小时到期，回复 Y 立即重连，N 稍后提醒`
+      await this.sendMsgSafe(this.lastContact.fromId, this.lastContact.contextToken, warn1)
       this.warningActive = true
 
       while (!this.stopped) {
@@ -1068,8 +1470,10 @@ class BotInstance {
         if (userReplied) { await this.doReconnect(); break }
         remaining = (this.loginTime + RECONNECT_CONFIG.session_duration * 1000 - Date.now()) / 1000
         if (remaining <= RECONNECT_CONFIG.force_before) continue
-        await this.sendMsgSafe(this.lastContact.fromId, this.lastContact.contextToken,
-          `[提醒] 连接还剩约 ${Math.round(remaining / 60)} 分钟，是否现在重新连接？回复 Y 立即重连，N 继续等待`)
+        // AI 生成循环二次提醒
+        const warn2 = await this.generateReconnectWarning(remaining) ||
+          `[提醒] 连接还剩约 ${Math.round(remaining / 60)} 分钟，回复 Y 立即重连，N 继续等待`
+        await this.sendMsgSafe(this.lastContact.fromId, this.lastContact.contextToken, warn2)
       }
     }
   }
@@ -1124,8 +1528,8 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
 // GET /api/auth/me
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
-    const [rows] = await db.query('SELECT quota, invite_code FROM users WHERE id = ?', [req.user.userId])
-    res.json({ userId: req.user.userId, username: req.user.username, role: req.user.role, quota: rows[0]?.quota ?? 0, inviteCode: rows[0]?.invite_code ?? '' })
+    const [rows] = await db.query('SELECT quota, invite_code, invite_count FROM users WHERE id = ?', [req.user.userId])
+    res.json({ userId: req.user.userId, username: req.user.username, role: req.user.role, quota: rows[0]?.quota ?? 0, inviteCode: rows[0]?.invite_code ?? '', inviteCount: rows[0]?.invite_count ?? 0 })
   } catch {
     res.json({ userId: req.user.userId, username: req.user.username, role: req.user.role, quota: 0, inviteCode: '' })
   }
@@ -1573,8 +1977,66 @@ app.put('/api/system-config', requireAuth, requireAdmin, async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// ========== 微信支付配置 CRUD API ==========
+app.get('/api/wx-pay-configs', requireAuth, requireAdmin, async (_req, res) => {
+  try { res.json(await dbGetWxPayConfigs()) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.post('/api/wx-pay-configs', requireAuth, requireAdmin, async (req, res) => {
+  const { name, appId, appSecret, mchId, mchKey, keyPath, notifyUrl } = req.body
+  if (!name?.trim())   return res.status(400).json({ error: '缺少配置名称' })
+  if (!appId?.trim())  return res.status(400).json({ error: '缺少 app_id' })
+  if (!mchId?.trim())  return res.status(400).json({ error: '缺少 mch_id' })
+  if (!mchKey?.trim()) return res.status(400).json({ error: '缺少 mch_key' })
+  try {
+    const id = await dbCreateWxPayConfig(
+      name.trim(), appId.trim(), appSecret?.trim() ?? '', mchId.trim(),
+      mchKey.trim(), keyPath?.trim() ?? '', notifyUrl?.trim() ?? ''
+    )
+    res.json({ id, ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.put('/api/wx-pay-configs/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { name, appId, appSecret, mchId, mchKey, keyPath, notifyUrl } = req.body
+  if (!name?.trim())  return res.status(400).json({ error: '缺少配置名称' })
+  if (!appId?.trim()) return res.status(400).json({ error: '缺少 app_id' })
+  if (!mchId?.trim()) return res.status(400).json({ error: '缺少 mch_id' })
+  try {
+    await dbUpdateWxPayConfig(
+      Number(req.params.id), name.trim(), appId.trim(), appSecret?.trim() ?? '',
+      mchId.trim(), mchKey ?? '', keyPath?.trim() ?? '', notifyUrl?.trim() ?? ''
+    )
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.delete('/api/wx-pay-configs/:id', requireAuth, requireAdmin, async (req, res) => {
+  try { await dbDeleteWxPayConfig(Number(req.params.id)); res.json({ ok: true }) }
+  catch (e) { res.status(409).json({ error: e.message }) }
+})
+app.patch('/api/wx-pay-configs/:id/active', requireAuth, requireAdmin, async (req, res) => {
+  try { await dbSetActiveWxPayConfig(Number(req.params.id)); res.json({ ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 // ========== 微信支付 SDK (V2) ==========
 async function wxGetConfig() {
+  // 1. 优先从 wx_pay_configs 表取活跃配置（带 1分钟缓存）
+  if (_wxPayConfigCache && Date.now() < _wxPayConfigCacheExp) return _wxPayConfigCache
+  try {
+    const [rows] = await db.query('SELECT * FROM wx_pay_configs WHERE is_active = 1 LIMIT 1')
+    if (rows[0]) {
+      const c = rows[0]
+      c._appid     = c.app_id     || ''
+      c._mchid     = c.mch_id     || ''
+      c._mchkey    = c.mch_key    || ''
+      c._appSecret = c.app_secret || ''
+      c._notifyUrl = c.notify_url || ''
+      _wxPayConfigCache    = c
+      _wxPayConfigCacheExp = Date.now() + 60000
+      return c
+    }
+  } catch {}
+  // 2. 回退到 system_config（兼容旧配置）
   const keys = [
     'wx_appid','wx_mchid','wx_api_key','wx_cert_serial','wx_private_key',
     'wx_notify_url','wx_app_secret',
@@ -1585,12 +2047,11 @@ async function wxGetConfig() {
   )
   const cfg = {}
   for (const r of rows) cfg[r.cfg_key] = r.cfg_value
-  // 小程序/公众号 AppID: 优先用 app_id，备用 wx_appid
-  cfg._appid      = cfg.app_id      || cfg.wx_appid      || ''
-  cfg._mchid      = cfg.mch_id      || cfg.wx_mchid      || ''
-  cfg._mchkey     = cfg.mch_key     || ''
-  cfg._notifyUrl  = cfg.notify_url  || cfg.wx_notify_url || ''
-  cfg._appSecret  = cfg.wx_app_secret || ''
+  cfg._appid     = cfg.app_id     || cfg.wx_appid  || ''
+  cfg._mchid     = cfg.mch_id     || cfg.wx_mchid  || ''
+  cfg._mchkey    = cfg.mch_key    || ''
+  cfg._appSecret = cfg.wx_app_secret || ''
+  cfg._notifyUrl = cfg.notify_url || cfg.wx_notify_url || ''
   return cfg
 }
 
@@ -1622,6 +2083,8 @@ async function createV2JsapiOrder(orderId, description, amountYuan, openid) {
   if (!cfg._appid || !cfg._mchid || !cfg._mchkey) {
     throw new Error('微信支付未配置，请在系统设置中填写 app_id、mch_id、mch_key')
   }
+  const actualNotifyUrl = cfg._notifyUrl || 'http://your-domain/api/wx-pay/notify'
+  console.log(`[${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}] [WxPay JSAPI下单] orderId=${orderId}, notify_url=${actualNotifyUrl}`)
   const nonceStr = randomBytes(16).toString('hex').substring(0, 32)
   const params = {
     appid:            cfg._appid,
@@ -1631,7 +2094,7 @@ async function createV2JsapiOrder(orderId, description, amountYuan, openid) {
     out_trade_no:     orderId,
     total_fee:        String(Math.round(amountYuan * 100)),
     spbill_create_ip: '127.0.0.1',
-    notify_url:       cfg._notifyUrl || 'http://your-domain/api/wx-pay/notify',
+    notify_url:       actualNotifyUrl,
     trade_type:       'JSAPI',
     openid:           openid,
   }
@@ -1647,6 +2110,40 @@ async function createV2JsapiOrder(orderId, description, amountYuan, openid) {
   if (result.return_code !== 'SUCCESS') throw new Error(result.return_msg || '请求失败')
   if (result.result_code !== 'SUCCESS') throw new Error(result.err_code_des || result.err_code || '下单失败')
   return result.prepay_id
+}
+
+// V2 Native 扫码支付
+async function createV2NativeOrder(orderId, description, amountYuan) {
+  const cfg = await wxGetConfig()
+  if (!cfg._appid || !cfg._mchid || !cfg._mchkey) {
+    throw new Error('微信支付未配置，请先在「支付配置」中填写 app_id、mch_id、mch_key')
+  }
+  const actualNotifyUrl = cfg._notifyUrl || 'http://your-domain/api/wx-pay/notify'
+  console.log(`[${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}] [WxPay下单] orderId=${orderId}, notify_url=${actualNotifyUrl}`)
+  const nonceStr = randomBytes(16).toString('hex').substring(0, 32)
+  const params = {
+    appid:            cfg._appid,
+    mch_id:           cfg._mchid,
+    nonce_str:        nonceStr,
+    body:             description,
+    out_trade_no:     orderId,
+    total_fee:        String(Math.round(amountYuan * 100)),
+    spbill_create_ip: '127.0.0.1',
+    notify_url:       actualNotifyUrl,
+    trade_type:       'NATIVE',
+  }
+  params.sign = wxV2Sign(params, cfg._mchkey)
+  const xml  = buildXml(params)
+  const resp = await fetch('https://api.mch.weixin.qq.com/pay/unifiedorder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
+    body: xml,
+  })
+  const text   = await resp.text()
+  const result = parseXml(text)
+  if (result.return_code !== 'SUCCESS') throw new Error(result.return_msg || '请求失败')
+  if (result.result_code !== 'SUCCESS') throw new Error(result.err_code_des || result.err_code || '下单失败')
+  return result.code_url
 }
 
 // V2 前端支付参数签名
@@ -1724,23 +2221,35 @@ app.get('/api/wx-jssdk-config', requireAuth, async (req, res) => {
 
 // ========== 订单 API ==========
 // POST /api/orders — 用户下单
+// payType: 'native'(默认,扫码) | 'jsapi'(小程序/公众号内)
 app.post('/api/orders', requireAuth, async (req, res) => {
-  const { packageId, openid } = req.body
+  const { packageId, openid, payType = 'native' } = req.body
   if (!packageId) return res.status(400).json({ error: '缺少 packageId' })
-  if (!openid)    return res.status(400).json({ error: '缺少微信openid，请在微信中打开此页面进行支付' })
   try {
     const [pkgRows] = await db.query('SELECT * FROM packages WHERE id = ? AND is_active = 1', [Number(packageId)])
     const pkg = pkgRows[0]
     if (!pkg) return res.status(404).json({ error: '套餐不存在或已下架' })
     const orderId = randomUUID().replace(/-/g, '').substring(0, 32)
     let jsapiParams = null
-    try {
-      const prepayId = await createV2JsapiOrder(orderId, pkg.name, Number(pkg.price), openid)
-      const cfg      = await wxGetConfig()
-      jsapiParams    = signV2JsapiParams(cfg._appid, prepayId, cfg._mchkey)
-    } catch (e) { console.log('[WxPay V2] 下单失败:', e.message) }
+    let codeUrl     = null
+    if (payType === 'jsapi' && openid) {
+      // JSAPI 支付（小程序 / 公众号内）
+      try {
+        const prepayId = await createV2JsapiOrder(orderId, pkg.name, Number(pkg.price), openid)
+        const cfg      = await wxGetConfig()
+        jsapiParams    = signV2JsapiParams(cfg._appid, prepayId, cfg._mchkey)
+      } catch (e) { console.log('[WxPay V2 JSAPI] 下单失败:', e.message) }
+    } else {
+      // Native 扫码支付（默认，PC / 手机均可）
+      try {
+        codeUrl = await createV2NativeOrder(orderId, pkg.name, Number(pkg.price))
+      } catch (e) {
+        console.log('[WxPay V2 Native] 下单失败:', e.message)
+        return res.status(500).json({ error: e.message })
+      }
+    }
     await dbCreateOrder(orderId, req.user.userId, pkg.id, pkg.price, pkg.quota)
-    res.json({ orderId, jsapiParams, amount: pkg.price, quota: pkg.quota, name: pkg.name })
+    res.json({ orderId, jsapiParams, codeUrl, amount: pkg.price, quota: pkg.quota, name: pkg.name })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -1758,54 +2267,259 @@ app.get('/api/orders/:id', requireAuth, async (req, res) => {
 
 // POST /api/wx-pay/notify — 微信支付V2 XML回调
 app.post('/api/wx-pay/notify', express.text({ type: '*/*', limit: '1mb' }), async (req, res) => {
+  const ts = () => new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
   const xmlReply = (code, msg) =>
     `<xml><return_code><![CDATA[${code}]]></return_code><return_msg><![CDATA[${msg}]]></return_msg></xml>`
+
+  console.log(`[${ts()}] [WxPay回调] ===== 收到微信支付回调请求 =====`)
+  console.log(`[${ts()}] [WxPay回调] Headers:`, JSON.stringify(req.headers).slice(0, 300))
+  console.log(`[${ts()}] [WxPay回调] Body长度: ${req.body?.length || 0}, 内容前200字: ${String(req.body || '').slice(0, 200)}`)
+
   try {
     const xmlBody = typeof req.body === 'string' ? req.body : ''
-    if (!xmlBody) return res.type('xml').send(xmlReply('FAIL', '无效通知'))
+    if (!xmlBody) {
+      console.log(`[${ts()}] [WxPay回调] ❌ 请求体为空，返回FAIL`)
+      return res.type('xml').send(xmlReply('FAIL', '无效通知'))
+    }
 
     const params = parseXml(xmlBody)
+    console.log(`[${ts()}] [WxPay回调] 解析XML参数:`, JSON.stringify({ return_code: params.return_code, result_code: params.result_code, out_trade_no: params.out_trade_no, total_fee: params.total_fee }))
 
     // MD5 验签
     const cfg = await wxGetConfig()
+    console.log(`[${ts()}] [WxPay回调] 支付配置: appid=${cfg._appid}, mchid=${cfg._mchid}, hasKey=${!!cfg._mchkey}, notifyUrl=${cfg._notifyUrl}`)
+
     if (cfg._mchkey) {
       const received = params.sign
       const computed = wxV2Sign(params, cfg._mchkey)
       if (received !== computed) {
-        console.error('[WxPay V2] 签名验证失败', { received, computed })
+        console.error(`[${ts()}] [WxPay回调] ❌ 签名验证失败 received=${received?.slice(0,10)}... computed=${computed?.slice(0,10)}...`)
         return res.type('xml').send(xmlReply('FAIL', '签名验证失败'))
       }
+      console.log(`[${ts()}] [WxPay回调] ✅ 签名验证通过`)
+    } else {
+      console.log(`[${ts()}] [WxPay回调] ⚠️ 未配置mch_key，跳过签名验证`)
     }
 
     if (params.return_code !== 'SUCCESS' || params.result_code !== 'SUCCESS') {
-      console.log('[WxPay V2] 商户处理失败:', params.err_code_des || params.return_msg)
+      console.log(`[${ts()}] [WxPay回调] ❌ 交易未成功: return_code=${params.return_code}, result_code=${params.result_code}, err=${params.err_code_des || params.return_msg}`)
       return res.type('xml').send(xmlReply('SUCCESS', 'OK'))
     }
 
     const orderId = params.out_trade_no
     const order   = await dbGetOrder(orderId)
-    if (!order) return res.type('xml').send(xmlReply('FAIL', '订单不存在'))
-    if (order.status === 'paid') return res.type('xml').send(xmlReply('SUCCESS', 'OK'))
+    if (!order) {
+      console.log(`[${ts()}] [WxPay回调] ❌ 订单不存在: ${orderId}`)
+      return res.type('xml').send(xmlReply('FAIL', '订单不存在'))
+    }
+    console.log(`[${ts()}] [WxPay回调] 订单信息: id=${orderId}, user_id=${order.user_id}, quota=${order.quota}, status=${order.status}`)
+
+    if (order.status === 'paid') {
+      console.log(`[${ts()}] [WxPay回调] ⚠️ 订单已处理过，跳过重复通知`)
+      return res.type('xml').send(xmlReply('SUCCESS', 'OK'))
+    }
 
     await dbUpdateOrderStatus(orderId, 'paid')
     await db.query('UPDATE users SET quota = quota + ? WHERE id = ?', [order.quota, order.user_id])
-    console.log(`[WxPay V2] 订单 ${orderId} 支付成功，用户 ${order.user_id} 增加 ${order.quota} 额度`)
+    console.log(`[${ts()}] [WxPay回调] ✅ 订单 ${orderId} 支付成功！用户 ${order.user_id} 增加 ${order.quota} 额度`)
     res.type('xml').send(xmlReply('SUCCESS', 'OK'))
   } catch (e) {
-    console.error('[WxPay V2] 回调处理失败:', e.message)
+    console.error(`[${ts()}] [WxPay回调] ❌ 处理异常:`, e.message, e.stack?.slice(0, 200))
     res.type('xml').send(xmlReply('FAIL', e.message))
   }
 })
 
-// SPA fallback
+// ========== 定时消息 CRUD API ==========
+app.get('/api/scheduled-messages', requireAuth, requireAdmin, async (_req, res) => {
+  try { res.json(await dbGetScheduledMessages()) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.post('/api/scheduled-messages', requireAuth, requireAdmin, async (req, res) => {
+  const { name, sendTime, message, targetBot, useAi, aiPrompt, timeWindow } = req.body
+  if (!name?.trim())     return res.status(400).json({ error: '缺少名称' })
+  if (!sendTime?.trim()) return res.status(400).json({ error: '缺少发送时间' })
+  if (!/^\d{2}:\d{2}$/.test(sendTime)) return res.status(400).json({ error: '时间格式错误，请用 HH:MM' })
+  if (!useAi && !message?.trim()) return res.status(400).json({ error: '未启用AI时备用文案不能为空' })
+  try {
+    const id = await dbCreateScheduledMsg(name.trim(), sendTime, message?.trim() || '', targetBot || null, !!useAi, aiPrompt?.trim() || null, Number(timeWindow) || 0)
+    res.json({ id, ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.put('/api/scheduled-messages/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { name, sendTime, message, targetBot, isActive, useAi, aiPrompt, timeWindow } = req.body
+  if (!name?.trim())     return res.status(400).json({ error: '缺少名称' })
+  if (!sendTime?.trim()) return res.status(400).json({ error: '缺少发送时间' })
+  if (!/^\d{2}:\d{2}$/.test(sendTime)) return res.status(400).json({ error: '时间格式错误，请用 HH:MM' })
+  if (!useAi && !message?.trim()) return res.status(400).json({ error: '未启用AI时备用文案不能为空' })
+  try {
+    await dbUpdateScheduledMsg(Number(req.params.id), name.trim(), sendTime, message?.trim() || '', targetBot || null, isActive !== false, !!useAi, aiPrompt?.trim() || null, Number(timeWindow) || 0)
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.delete('/api/scheduled-messages/:id', requireAuth, requireAdmin, async (req, res) => {
+  try { await dbDeleteScheduledMsg(Number(req.params.id)); res.json({ ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+// POST /api/scheduled-messages/:id/send-now — 立即测试发送
+app.post('/api/scheduled-messages/:id/send-now', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT * FROM scheduled_messages WHERE id = ?', [Number(req.params.id)])
+    const msg = rows[0]
+    if (!msg) return res.status(404).json({ error: '消息不存在' })
+    const count = await broadcastScheduledMessage(msg)
+    res.json({ ok: true, sent: count })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ========== 记忆与人设管理 API ==========
+// GET /api/memory/:botId/:userId — 获取全部长期记忆
+app.get('/api/memory/:botId/:userId', requireAuth, requireAdmin, async (req, res) => {
+  try { res.json(await dbGetAllLongMemory(req.params.botId, req.params.userId)) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+// DELETE /api/memory/:id — 删除单条记忆
+app.delete('/api/memory/:id', requireAuth, requireAdmin, async (req, res) => {
+  try { await dbDeleteLongMemory(Number(req.params.id)); res.json({ ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+// GET /api/base-role/:botId/:userId — 获取专属人设
+app.get('/api/base-role/:botId/:userId', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = await dbGetBaseRole(req.params.botId, req.params.userId)
+    res.json(row ?? { bot_id: req.params.botId, user_id: req.params.userId, base_prompt: '', last_update: null })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+// PUT /api/base-role/:botId/:userId — 手动编辑人设
+app.put('/api/base-role/:botId/:userId', requireAuth, requireAdmin, async (req, res) => {
+  const { base_prompt } = req.body
+  if (base_prompt === undefined) return res.status(400).json({ error: '缺少 base_prompt' })
+  try {
+    await dbInitBaseRole(req.params.botId, req.params.userId)
+    await dbSetBaseRole(req.params.botId, req.params.userId, base_prompt)
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+// GET /api/memory-users — 返回最近活跃用户列表（供前端下拉选择）
+app.get('/api/memory-users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      'SELECT bot_id, from_id AS user_id, last_seen FROM user_sessions ORDER BY last_seen DESC LIMIT 200'
+    )
+    res.json(rows)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// SPA fallback — 必须放在所有 API 路由之后
 if (fs.existsSync(frontendDist)) {
   app.get('*', (_req, res) => res.sendFile(path.join(frontendDist, 'index.html')))
+}
+
+// ========== 定时消息广播引擎 ==========
+async function broadcastScheduledMessage(msg) {
+  let messageText = msg.message || ''
+
+  // AI 生成内容
+  if (msg.use_ai && msg.ai_prompt) {
+    try {
+      const now = new Date()
+      const timeCtx = `现在是${now.getHours()}时${now.getMinutes()}分`
+      messageText = await callAI(
+        '你是一个温柔有个性的AI聊天伙伴，根据提示生成一条微信消息，自然亲切，不超过80字。',
+        `${msg.ai_prompt}\n\n时间背景：${timeCtx}`,
+        300
+      )
+    } catch (e) {
+      console.log(`[定时消息「${msg.name}」] AI生成失败，使用备用文案:`, e.message)
+    }
+  }
+
+  if (!messageText) {
+    console.log(`[定时消息「${msg.name}」] 无消息内容，跳过`)
+    return 0
+  }
+
+  const sessions = await dbGetUserSessions(msg.target_bot || null, 72)
+  let sent = 0
+  for (const session of sessions) {
+    const bot = botsMap.get(session.bot_id)
+    if (!bot || bot.status !== 'active') continue
+    try {
+      await bot.sendMsgSafe(session.from_id, session.context_token, messageText)
+      sent++
+      await new Promise(r => setTimeout(r, 150))
+    } catch (e) {
+      console.log(`[定时消息] 发送失败 bot=${session.bot_id} user=${session.from_id}: ${e.message}`)
+    }
+  }
+  console.log(`[定时消息「${msg.name}」] 共发送 ${sent}/${sessions.length} 个用户`)
+  return sent
+}
+
+// ========== node-cron 调度器 ==========
+function initScheduler() {
+  cron.schedule('* * * * *', async () => {
+    const now     = new Date()
+    const nowMins = now.getHours() * 60 + now.getMinutes()
+    try {
+      const msgs = await dbGetScheduledMessages(true)
+      for (const msg of msgs) {
+        const fireMins = getTodayFireMinute(msg.id, msg.send_time, msg.time_window || 0)
+        if (nowMins === fireMins) {
+          const fireHH = String(Math.floor(fireMins / 60)).padStart(2, '0')
+          const fireMM = String(fireMins % 60).padStart(2, '0')
+          console.log(`[定时调度] 触发「${msg.name}」 @ ${fireHH}:${fireMM} (窗口偏移 ${fireMins - (msg.send_time.split(':').map(Number)[0]*60 + msg.send_time.split(':').map(Number)[1])} 分钟)`)
+          broadcastScheduledMessage(msg).catch(e => console.error('[定时调度] 广播失败:', e.message))
+        }
+      }
+    } catch (e) { console.error('[定时调度] 检查失败:', e.message) }
+  })
+  console.log('[定时调度器] 已启动，每分钟检查一次')
+
+  // 每周一凌晨 3 点执行人设自动进化
+  cron.schedule('0 3 * * 1', async () => {
+    console.log('[人设进化] 开始每周任务...')
+    try {
+      const since = new Date(Date.now() - 7 * 24 * 3600 * 1000)
+      const [combos] = await db.query(
+        'SELECT DISTINCT bot_id, user_id FROM tb_chat_record WHERE created_at > ?', [since]
+      )
+      let processed = 0
+      for (const { bot_id, user_id } of combos) {
+        try {
+          const records = await dbGetWeeklyChatRecord(bot_id, user_id, since)
+          const filtered = records.filter(r => r.content.length >= 4)
+            .reduce((acc, r) => {
+              const last = acc[acc.length - 1]
+              if (!last || last.content !== r.content) acc.push(r)
+              return acc
+            }, []).slice(-60)
+          if (filtered.length < 6) continue
+          const dialogue = filtered.map(r => (r.role === 'user' ? '用户：' : 'AI：') + r.content).join('\n')
+          const newTraits = await callAI(
+            '你是人格分析师，精简输出，不要多余描述。',
+            `根据下面 7 天对话，提炼：1.AI新增口头禅/常用语气词；2.新养成的说话小习惯；3.两人专属小棖。每项精简一句。\n\n${dialogue}`,
+            200
+          )
+          if (newTraits && newTraits.trim()) {
+            const today = new Date().toISOString().slice(0, 10)
+            await dbAppendBaseRole(bot_id, user_id, `\n[【${today}新增习惯】${newTraits.trim()}]`)
+            await db.query('UPDATE tb_base_role SET last_update=? WHERE bot_id=? AND user_id=?', [today, bot_id, user_id])
+            processed++
+          }
+          await new Promise(r => setTimeout(r, 500)) // 限流
+        } catch (e) { console.log(`[人设进化] 处理 ${bot_id}/${user_id} 失败:`, e.message) }
+      }
+      console.log(`[人设进化] 完成，共处理 ${processed}/${combos.length} 个用户`)
+    } catch (e) { console.error('[人设进化] 任务失败:', e.message) }
+  })
+  console.log('[人设进化调度] 已配置，每周一凌晨 3 点执行')
 }
 
 // ========== 启动 ==========
 async function main() {
   console.log('正在连接 MySQL...')
   await initDB()
+  await initMemoryTables()
 
   const savedBots = await dbGetBots()
   console.log(`从数据库加载 ${savedBots.length} 个 Bot`)
@@ -1817,11 +2531,8 @@ async function main() {
 
   const PORT = process.env.PORT ?? 8849
   app.listen(PORT, () => {
-    console.log(`
-╔══════════════════════════════════════════════════════════╗
-║        微信 ClawBot 管理面板  ·  WeChat iLink Bot         ║
-║  后端已启动  →  http://localhost:${PORT}                     ║
-╚══════════════════════════════════════════════════════════╝`)
+    console.log(`\n[定时调度器] 服务已在 ${PORT} 端口启动`)
+    initScheduler()
   })
 }
 

@@ -60,17 +60,6 @@ const sections: { title: string; keys: { key: string; label: string; placeholder
       { key: 'quota_warning_url', label: '额度不足提示链接', placeholder: 'http://wxhot.xmhwl.cn' },
     ],
   },
-  {
-    title: '微信支付配置（JSAPI Pay V2）',
-    keys: [
-      { key: 'app_id',        label: 'app_id （微信AppID）',          placeholder: 'wx851c13bd9ee9e221' },
-      { key: 'wx_app_secret', label: 'AppSecret （公众号）',       placeholder: '用于OAuth静默授权获取openid' },
-      { key: 'mch_id',        label: 'mch_id （商户号）',          placeholder: '1723112046' },
-      { key: 'mch_key',       label: 'mch_key （V2密钒，32位）',  placeholder: '微信V2密钒，32位字符串' },
-      { key: 'key_path',      label: 'key_path （证书路径）',   placeholder: '/www/wwwroot/cert/apiclient_key.pem' },
-      { key: 'notify_url',    label: 'notify_url （回调URL）',       placeholder: 'https://你的域名/api/wx-pay/notify' },
-    ],
-  },
 ]
 </script>
 

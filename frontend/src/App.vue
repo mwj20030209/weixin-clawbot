@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { Plus, Search, Bot as BotIcon, BookOpen, Cpu, Users, LogOut, Sparkles, Menu, X, Package, Settings, ShoppingCart, Gift } from 'lucide-vue-next'
+import { Plus, Search, Bot as BotIcon, BookOpen, Cpu, Users, LogOut, Sparkles, Menu, X, Package, Settings, ShoppingCart, Gift, CreditCard, Clock, Brain } from 'lucide-vue-next'
 import { apiUrl } from './lib/api'
 import StatCard from './components/StatCard.vue'
 import BotCard, { type Bot, type BotStatus } from './components/BotCard.vue'
@@ -13,6 +13,9 @@ import UsersModal from './components/UsersModal.vue'
 import PromptTemplatesModal from './components/PromptTemplatesModal.vue'
 import PackagesModal from './components/PackagesModal.vue'
 import SystemConfigModal from './components/SystemConfigModal.vue'
+import WxPayConfigsModal from './components/WxPayConfigsModal.vue'
+import ScheduledMsgsModal from './components/ScheduledMsgsModal.vue'
+import MemoryMgrModal from './components/MemoryMgrModal.vue'
 import QuotaShopModal from './components/QuotaShopModal.vue'
 import LoginPage from './components/LoginPage.vue'
 
@@ -21,7 +24,9 @@ const authToken     = ref(localStorage.getItem('clawbot_token') ?? '')
 const authUsername  = ref(localStorage.getItem('clawbot_username') ?? '')
 const authRole      = ref(localStorage.getItem('clawbot_role') ?? '')
 const authQuota     = ref(Number(localStorage.getItem('clawbot_quota') ?? 0))
-const authInviteCode = ref(localStorage.getItem('clawbot_invite_code') ?? '')
+const authInviteCode  = ref(localStorage.getItem('clawbot_invite_code') ?? '')
+const authInviteCount = ref(Number(localStorage.getItem('clawbot_invite_count') ?? 0))
+const copiedInvite    = ref(false)
 const isLoggedIn    = computed(() => !!authToken.value)
 
 function apiFetch(url: string, init: RequestInit = {}) {
@@ -35,31 +40,35 @@ function apiFetch(url: string, init: RequestInit = {}) {
   })
 }
 
-function handleLogin({ token, username, role, quota, inviteCode }: { token: string; username: string; role: string; quota?: number; inviteCode?: string }) {
-  authToken.value      = token
-  authUsername.value   = username
-  authRole.value       = role
-  authQuota.value      = quota ?? 0
-  authInviteCode.value = inviteCode ?? ''
-  localStorage.setItem('clawbot_token',       token)
-  localStorage.setItem('clawbot_username',    username)
-  localStorage.setItem('clawbot_role',        role)
-  localStorage.setItem('clawbot_quota',       String(quota ?? 0))
-  localStorage.setItem('clawbot_invite_code', inviteCode ?? '')
+function handleLogin({ token, username, role, quota, inviteCode, inviteCount }: { token: string; username: string; role: string; quota?: number; inviteCode?: string; inviteCount?: number }) {
+  authToken.value       = token
+  authUsername.value    = username
+  authRole.value        = role
+  authQuota.value       = quota ?? 0
+  authInviteCode.value  = inviteCode ?? ''
+  authInviteCount.value = inviteCount ?? 0
+  localStorage.setItem('clawbot_token',        token)
+  localStorage.setItem('clawbot_username',     username)
+  localStorage.setItem('clawbot_role',         role)
+  localStorage.setItem('clawbot_quota',        String(quota ?? 0))
+  localStorage.setItem('clawbot_invite_code',  inviteCode ?? '')
+  localStorage.setItem('clawbot_invite_count', String(inviteCount ?? 0))
 }
 
 async function handleLogout() {
   try { await apiFetch('/api/auth/logout', { method: 'POST' }) } catch {}
-  authToken.value      = ''
-  authUsername.value   = ''
-  authRole.value       = ''
-  authQuota.value      = 0
-  authInviteCode.value = ''
+  authToken.value       = ''
+  authUsername.value    = ''
+  authRole.value        = ''
+  authQuota.value       = 0
+  authInviteCode.value  = ''
+  authInviteCount.value = 0
   localStorage.removeItem('clawbot_token')
   localStorage.removeItem('clawbot_username')
   localStorage.removeItem('clawbot_role')
   localStorage.removeItem('clawbot_quota')
   localStorage.removeItem('clawbot_invite_code')
+  localStorage.removeItem('clawbot_invite_count')
   bots.value = []
 }
 
@@ -74,10 +83,12 @@ async function verifySession() {
       localStorage.removeItem('clawbot_role')
     } else {
       const data = await res.json()
-      authQuota.value      = data.quota ?? 0
-      authInviteCode.value = data.inviteCode ?? ''
-      localStorage.setItem('clawbot_quota',       String(data.quota ?? 0))
-      localStorage.setItem('clawbot_invite_code', data.inviteCode ?? '')
+      authQuota.value       = data.quota ?? 0
+      authInviteCode.value  = data.inviteCode ?? ''
+      authInviteCount.value = data.inviteCount ?? 0
+      localStorage.setItem('clawbot_quota',        String(data.quota ?? 0))
+      localStorage.setItem('clawbot_invite_code',  data.inviteCode ?? '')
+      localStorage.setItem('clawbot_invite_count', String(data.inviteCount ?? 0))
     }
   } catch {}
 }
@@ -119,6 +130,9 @@ const usersOpen          = ref(false)
 const promptTplOpen      = ref(false)
 const packagesOpen       = ref(false)
 const systemConfigOpen   = ref(false)
+const wxPayConfigsOpen   = ref(false)
+const scheduledMsgsOpen  = ref(false)
+const memoryMgrOpen      = ref(false)
 const quotaShopOpen      = ref(false)
 const menuOpen           = ref(false)   // 手机端汉堡菜单
 
@@ -232,6 +246,22 @@ function handleQuotaUpdated(q: number) {
   authQuota.value = q
   localStorage.setItem('clawbot_quota', String(q))
 }
+
+async function copyInviteCode() {
+  if (!authInviteCode.value) return
+  try {
+    await navigator.clipboard.writeText(authInviteCode.value)
+  } catch {
+    const el = document.createElement('input')
+    el.value = authInviteCode.value
+    document.body.appendChild(el)
+    el.select()
+    document.execCommand('copy')
+    document.body.removeChild(el)
+  }
+  copiedInvite.value = true
+  setTimeout(() => { copiedInvite.value = false }, 2000)
+}
 </script>
 
 <template>
@@ -273,6 +303,15 @@ function handleQuotaUpdated(q: number) {
           <button class="lib-btn" @click="packagesOpen = true">
             <Package :size="14" /> 套餐管理
           </button>
+          <button class="lib-btn" @click="wxPayConfigsOpen = true">
+            <CreditCard :size="14" /> 支付配置
+          </button>
+          <button class="lib-btn" @click="scheduledMsgsOpen = true">
+            <Clock :size="14" /> 定时消息
+          </button>
+          <button class="lib-btn" @click="memoryMgrOpen = true">
+            <Brain :size="14" /> 记忆管理
+          </button>
           <button class="lib-btn" @click="systemConfigOpen = true">
             <Settings :size="14" /> 系统设置
           </button>
@@ -280,11 +319,13 @@ function handleQuotaUpdated(q: number) {
 
         <!-- 右侧：用户信息 + 操作 -->
         <div class="flex items-center gap-1.5 shrink-0">
-          <!-- 额度显示 -->
-          <button v-if="authRole !== 'admin'" class="quota-badge" @click="quotaShopOpen = true" title="购买额度">
-            <Gift :size="12" />额度：{{ authQuota }}
+        <!-- 额度显示（普通用户） -->
+          <button v-if="authRole !== 'admin'" class="quota-badge-new" @click="quotaShopOpen = true">
+            <span class="qb-label">额度</span>
+            <span class="qb-num">{{ authQuota }}</span>
+            <span class="qb-cta">充値 +</span>
           </button>
-          <span v-else class="hidden sm:inline text-[12px] text-[#86909C]">额度: {{ authQuota }}</span>
+          <span v-else class="hidden sm:inline text-[12px] text-[#86909C]">Admin 额度: {{ authQuota }}</span>
           <!-- 用户名 + 角色（仅 sm+ 显示用户名） -->
           <span class="hidden sm:inline text-[13px] text-[#4E5969]">{{ authUsername }}</span>
           <span class="role-tag" :class="authRole">{{ authRole === 'admin' ? '管理员' : '用户' }}</span>
@@ -328,6 +369,18 @@ function handleQuotaUpdated(q: number) {
             <Package :size="16" style="color:#4080FF" />
             <span>套餐管理</span>
           </button>
+          <button class="mobile-menu-item" @click="openMenu(() => wxPayConfigsOpen = true)">
+            <CreditCard :size="16" style="color:#4080FF" />
+            <span>支付配置</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => scheduledMsgsOpen = true)">
+            <Clock :size="16" style="color:#7B61FF" />
+            <span>定时消息</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => memoryMgrOpen = true)">
+            <Brain :size="16" style="color:#7B61FF" />
+            <span>记忆管理</span>
+          </button>
           <button class="mobile-menu-item" @click="openMenu(() => systemConfigOpen = true)">
             <Settings :size="16" style="color:#4E5969" />
             <span>系统设置</span>
@@ -345,6 +398,24 @@ function handleQuotaUpdated(q: number) {
         <StatCard variant="active"   :value="stats.active" />
         <StatCard variant="scanning" :value="stats.scanning" />
         <StatCard variant="stopped"  :value="stats.stopped" />
+      </div>
+
+      <!-- 邀请活动横幅（仅普通用户显示） -->
+      <div v-if="authRole !== 'admin' && authInviteCode" class="invite-banner mt-4 sm:mt-5">
+        <div class="invite-banner-left">
+          <div class="invite-title">🎁 邀请好友，双方各得额度奖励</div>
+          <div class="invite-desc">*每成功邀请一个好友注册，双方各得额外聊天额度</div>
+          <div v-if="authInviteCount > 0" class="invite-count-badge">👥 已成功邀请 {{ authInviteCount }} 人</div>
+        </div>
+        <div class="invite-banner-right">
+          <div class="invite-code-label">我的邀请码</div>
+          <div class="invite-code-row">
+            <span class="invite-code-text">{{ authInviteCode }}</span>
+            <button class="invite-copy-btn" :class="{ copied: copiedInvite }" @click="copyInviteCode">
+              {{ copiedInvite ? '✓ 已复制' : '复制' }}
+            </button>
+          </div>
+        </div>
       </div>
 
       <!-- 工具栏 -->
@@ -395,6 +466,9 @@ function handleQuotaUpdated(q: number) {
     <PromptTemplatesModal :open="promptTplOpen"  :token="authToken" @update:open="promptTplOpen = $event" />
     <PackagesModal       :open="packagesOpen"    :token="authToken" @update:open="packagesOpen = $event" />
     <SystemConfigModal   :open="systemConfigOpen" :token="authToken" @update:open="systemConfigOpen = $event" />
+    <WxPayConfigsModal   :open="wxPayConfigsOpen" :token="authToken" @update:open="wxPayConfigsOpen = $event" />
+    <ScheduledMsgsModal  :open="scheduledMsgsOpen" :token="authToken" @update:open="scheduledMsgsOpen = $event" />
+    <MemoryMgrModal       :open="memoryMgrOpen"     :token="authToken" @update:open="memoryMgrOpen = $event" />
     <QuotaShopModal      :open="quotaShopOpen"   :token="authToken"
       @update:open="quotaShopOpen = $event"
       @quota-updated="handleQuotaUpdated"
@@ -452,6 +526,48 @@ function handleQuotaUpdated(q: number) {
   transition:all .15s;
 }
 .quota-badge:hover { background:rgba(64,128,255,.18); }
+
+/* 适度徽章新版 */
+.quota-badge-new {
+  display:inline-flex; align-items:center; gap:0;
+  height:30px; border-radius:20px; overflow:hidden;
+  border:none; cursor:pointer; white-space:nowrap;
+  background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+  box-shadow: 0 2px 8px rgba(102,126,234,.4);
+  transition:all .18s; flex-shrink:0;
+}
+.quota-badge-new:hover { transform:translateY(-1px); box-shadow:0 4px 14px rgba(102,126,234,.5); }
+.qb-label { padding:0 8px 0 12px; font-size:11px; color:rgba(255,255,255,.8); }
+.qb-num   { padding:0 8px; font-size:13px; font-weight:700; color:#fff; }
+.qb-cta   { background:rgba(255,255,255,.22); padding:0 10px; height:30px; display:flex; align-items:center; font-size:11px; font-weight:600; color:#fff; border-left:1px solid rgba(255,255,255,.2); }
+
+/* 邀请横幅 */
+.invite-banner {
+  border-radius:14px;
+  background: linear-gradient(135deg, #6B46C1 0%, #B8368C 50%, #F25F4C 100%);
+  padding:16px 20px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  flex-wrap:wrap;
+}
+.invite-banner-left  { flex:1; min-width:180px; }
+.invite-title  { font-size:15px; font-weight:700; color:#fff; margin-bottom:4px; }
+.invite-desc   { font-size:12px; color:rgba(255,255,255,.75); }
+.invite-count-badge { display:inline-flex; align-items:center; gap:4px; margin-top:8px; background:rgba(255,255,255,.2); border-radius:20px; padding:3px 10px; font-size:11px; color:#fff; }
+.invite-banner-right { text-align:center; }
+.invite-code-label  { font-size:11px; color:rgba(255,255,255,.7); margin-bottom:6px; }
+.invite-code-row    { display:flex; align-items:center; gap:8px; }
+.invite-code-text   { font-size:20px; font-weight:800; letter-spacing:4px; color:#fff; font-family:monospace; background:rgba(255,255,255,.15); padding:6px 14px; border-radius:8px; }
+.invite-copy-btn {
+  height:34px; padding:0 14px; border-radius:8px;
+  background:rgba(255,255,255,.25); border:1px solid rgba(255,255,255,.4);
+  color:#fff; font-size:12px; font-weight:600; cursor:pointer;
+  transition:all .15s; white-space:nowrap;
+}
+.invite-copy-btn:hover  { background:rgba(255,255,255,.4); }
+.invite-copy-btn.copied { background:rgba(0,180,42,.7); border-color:transparent; }
 
 .logout-btn {
   width:32px; height:32px; border-radius:8px; background:transparent; border:none;

@@ -3,12 +3,14 @@
   "scripts": {
     "dev": "concurrently --kill-others-on-fail \"node server.js\" \"cd frontend && npm run dev\"",
     "start": "node server.js",
-    "dev:front": "cd frontend && npm run dev"
+    "dev:front": "cd frontend && npm run dev",
+    "test": "node test-memory.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "express": "^4.19.0",
     "mysql2": "^3.9.0",
+    "node-cron": "^4.2.1",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
