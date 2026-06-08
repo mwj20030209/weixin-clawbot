@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, reactive, watch, onMounted } from 'vue'
-import { Plus, Save, Trash2, ShieldCheck, User, Eye, EyeOff, ChevronLeft } from 'lucide-vue-next'
+import { Plus, Save, Trash2, ShieldCheck, User, Eye, EyeOff, ChevronLeft, Plus as PlusIcon, Minus } from 'lucide-vue-next'
 import { apiUrl } from '../lib/api'
 
-type UserRow = { id: number; username: string; password_plain: string; role: 'admin' | 'user'; created_at: string }
+type UserRow = { id: number; username: string; password_plain: string; role: 'admin' | 'user'; quota: number; invite_code: string; invite_count: number; created_at: string }
 
 const props = defineProps<{ open: boolean; token: string }>()
 const emit  = defineEmits<{ (e: 'update:open', v: boolean): void }>()
@@ -17,6 +17,9 @@ const deleting  = ref(false)
 const errMsg    = ref('')
 const showPwd   = ref(false)
 const mobileView = ref<'list' | 'form'>('list')
+const quotaInput = ref(0)
+const quotaDelta = ref(100)
+const adjustingQuota = ref(false)
 
 const form = reactive({ username: '', password: '', role: 'user' as 'admin' | 'user' })
 
@@ -39,8 +42,9 @@ function selectUser(u: UserRow) {
   isCreating.value = false
   mobileView.value = 'form'
   form.username = u.username
-  form.password = u.password_plain ?? ''   // 显示已存的明文密码
+  form.password = u.password_plain ?? ''
   form.role     = u.role
+  quotaInput.value = u.quota ?? 0
   showPwd.value = false
   errMsg.value  = ''
 }
@@ -53,6 +57,21 @@ function newUser() {
   form.password = ''
   form.role     = 'user'
   errMsg.value  = ''
+}
+
+async function adjustQuota(delta: number) {
+  if (!activeId.value) return
+  adjustingQuota.value = true
+  try {
+    const res  = await fetch(apiUrl(`/api/users/${activeId.value}/quota`), {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify({ delta }),
+    })
+    const data = await res.json()
+    if (!res.ok) { errMsg.value = data.error ?? '调整失败'; return }
+    quotaInput.value = data.quota
+    const u = users.value.find(x => x.id === activeId.value)
+    if (u) u.quota = data.quota
+  } finally { adjustingQuota.value = false }
 }
 
 async function save() {
@@ -145,8 +164,9 @@ onMounted(() => { if (props.open) loadUsers() })
                     :style="{ color: u.role === 'admin' ? '#4080FF' : '#86909C', flexShrink: 0 }" />
                   <span class="truncate text-[13px]" style="color:#1D2129">{{ u.username }}</span>
                 </div>
-                <div class="text-[11px] text-[#86909C] mt-0.5 text-left">
-                  密码：{{ u.password_plain || '—' }}
+                <div class="text-[11px] text-[#86909C] mt-0.5 text-left flex items-center gap-2">
+                  <span>密码：{{ u.password_plain || '—' }}</span>
+                  <span class="text-[#4080FF] font-medium">额度:{{ u.quota ?? 0 }}</span>
                 </div>
                 <span class="role-badge" :class="u.role">{{ u.role === 'admin' ? '管理员' : '普通用户' }}</span>
               </button>
@@ -201,6 +221,20 @@ onMounted(() => { if (props.open) loadUsers() })
                     <span>管理员</span>
                     <span class="text-[11px] text-[#86909C] block mt-0.5">可看全部 Bot & 用户</span>
                   </label>
+                </div>
+              </div>
+
+              <!-- 额度管理 (only for existing users) -->
+              <div v-if="activeId !== null && !isCreating">
+                <label class="block text-[12px] text-[#86909C] mb-2">剩余额度：<span class="text-[#1D2129] font-semibold text-[14px]">{{ quotaInput }}</span> 条</label>
+                <div class="flex items-center gap-2">
+                  <input v-model.number="quotaDelta" type="number" min="1" class="form-input" style="width:90px" placeholder="条数" />
+                  <button class="btn btn-primary" :disabled="adjustingQuota" @click="adjustQuota(quotaDelta)">
+                    <PlusIcon :size="13" /> 增加
+                  </button>
+                  <button class="btn btn-danger" style="padding:0 12px" :disabled="adjustingQuota" @click="adjustQuota(-quotaDelta)">
+                    <Minus :size="13" /> 扣减
+                  </button>
                 </div>
               </div>
 

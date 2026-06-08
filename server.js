@@ -2,7 +2,7 @@ import fs from 'fs'
 import express from 'express'
 import mysql from 'mysql2/promise'
 import bcrypt from 'bcryptjs'
-import { randomUUID } from 'crypto'
+import { randomUUID, createSign, randomBytes, createDecipheriv, createHash } from 'crypto'
 import { fileURLToPath } from 'url'
 import path from 'path'
 
@@ -111,6 +111,12 @@ function calcDelay(text) {
   const think  = 0.5 + Math.random() * 1.0          // 0.5-1.5s 思考停顿
   const total  = base + jitter + think
   return Math.min(8000, Math.max(800, Math.round(total * 1000)))
+}
+
+function generateInviteCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const bytes = randomBytes(8)
+  return Array.from(bytes).map(b => chars[b % chars.length]).join('')
 }
 
 function makeHeaders(token) {
@@ -224,6 +230,99 @@ async function initDB() {
     }
   } catch (e) { console.log('[DB] AI配置迁移跳过:', e.message) }
 
+  // users: quota
+  try {
+    const [r] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='quota'`)
+    if (r.length === 0) { await db.query(`ALTER TABLE users ADD COLUMN quota INT DEFAULT 30`); console.log('[DB] 已添加 users.quota') }
+  } catch {}
+
+  // users: invite_code
+  try {
+    const [r] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='invite_code'`)
+    if (r.length === 0) { await db.query(`ALTER TABLE users ADD COLUMN invite_code VARCHAR(12) NULL`); console.log('[DB] 已添加 users.invite_code') }
+  } catch {}
+
+  // users: invited_by
+  try {
+    const [r] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='invited_by'`)
+    if (r.length === 0) { await db.query(`ALTER TABLE users ADD COLUMN invited_by INT NULL`); console.log('[DB] 已添加 users.invited_by') }
+  } catch {}
+
+  // users: invite_count
+  try {
+    const [r] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='invite_count'`)
+    if (r.length === 0) { await db.query(`ALTER TABLE users ADD COLUMN invite_count INT DEFAULT 0`); console.log('[DB] 已添加 users.invite_count') }
+  } catch {}
+
+  // 套餐表
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS packages (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      name       VARCHAR(100) NOT NULL,
+      quota      INT NOT NULL,
+      price      DECIMAL(10,2) NOT NULL,
+      is_active  TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`)
+  } catch (e) { console.log('[DB] 套餐表初始化失败:', e.message) }
+
+  // 订单表
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS orders (
+      id           VARCHAR(36) PRIMARY KEY,
+      user_id      INT NOT NULL,
+      package_id   INT NOT NULL,
+      amount       DECIMAL(10,2) NOT NULL,
+      quota        INT NOT NULL,
+      status       ENUM('pending','paid','failed') DEFAULT 'pending',
+      wx_prepay_id VARCHAR(255),
+      paid_at      TIMESTAMP NULL,
+      created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`)
+  } catch (e) { console.log('[DB] 订单表初始化失败:', e.message) }
+
+  // 系统配置表
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS system_config (
+      cfg_key   VARCHAR(100) PRIMARY KEY,
+      cfg_value TEXT NOT NULL
+    )`)
+    await db.query(`INSERT IGNORE INTO system_config (cfg_key, cfg_value) VALUES
+      ('default_register_quota','30'),
+      ('invite_threshold','3'),
+      ('invite_reward_quota','200'),
+      ('quota_warning_url','http://wxhot.xmhwl.cn'),
+      ('wx_appid',''),
+      ('wx_mchid',''),
+      ('wx_api_key',''),
+      ('wx_cert_serial',''),
+      ('wx_private_key',''),
+      ('wx_notify_url','http://your-domain/api/wx-pay/notify'),
+      ('wx_app_secret',''),
+      ('app_id',''),
+      ('mch_id',''),
+      ('mch_key',''),
+      ('key_path',''),
+      ('notify_url','')
+    `)
+    console.log('[DB] 系统配置表初始化完成')
+  } catch (e) { console.log('[DB] 系统配置表初始化失败:', e.message) }
+
+  // users: openid
+  try {
+    const [r] = await db.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='openid'`)
+    if (r.length === 0) { await db.query(`ALTER TABLE users ADD COLUMN openid VARCHAR(64) NULL`); console.log('[DB] 已添加 users.openid') }
+  } catch {}
+
+  // 给已有用户生成邀请码
+  try {
+    const [usersNoCode] = await db.query(`SELECT id FROM users WHERE invite_code IS NULL OR invite_code = ''`)
+    for (const u of usersNoCode) {
+      await db.query(`UPDATE users SET invite_code = ? WHERE id = ?`, [generateInviteCode(), u.id])
+    }
+    if (usersNoCode.length > 0) console.log(`[DB] 为 ${usersNoCode.length} 个用户生成了邀请码`)
+  } catch {}
+
   console.log('[DB] 初始化完成')
 }
 
@@ -316,7 +415,7 @@ const sessions = new Map()
 
 async function dbGetUsers() {
   const [rows] = await db.query(
-    'SELECT id, username, password_plain, role, created_at FROM users ORDER BY id ASC'
+    'SELECT id, username, password_plain, role, quota, invite_code, invite_count, created_at FROM users ORDER BY id ASC'
   )
   return rows
 }
@@ -326,11 +425,16 @@ async function dbGetUser(id) {
   return rows[0] ?? null
 }
 
-async function dbCreateUser(username, password, role = 'user') {
+async function dbCreateUser(username, password, role = 'user', quota = null) {
   const hash = await bcrypt.hash(password, 10)
+  const inviteCode = generateInviteCode()
+  let userQuota = quota
+  if (userQuota === null) {
+    userQuota = parseInt(await dbGetSystemConfig('default_register_quota') || '30') || 30
+  }
   const [result] = await db.query(
-    'INSERT INTO users (username, password, password_plain, role) VALUES (?, ?, ?, ?)',
-    [username, hash, password, role]
+    'INSERT INTO users (username, password, password_plain, role, quota, invite_code) VALUES (?, ?, ?, ?, ?, ?)',
+    [username, hash, password, role, userQuota, inviteCode]
   )
   return result.insertId
 }
@@ -442,6 +546,70 @@ async function dbSetActiveProvider(id) {
   await db.query('UPDATE ai_providers SET is_active = 0')
   await db.query('UPDATE ai_providers SET is_active = 1 WHERE id = ?', [id])
   _aiProviderCache = null  // 清缓存，下次调用重新读取
+}
+
+// ========== 系统配置 ==========
+async function dbGetSystemConfig(key) {
+  try {
+    const [rows] = await db.query('SELECT cfg_value FROM system_config WHERE cfg_key = ?', [key])
+    return rows[0]?.cfg_value ?? null
+  } catch { return null }
+}
+async function dbGetAllSystemConfig() {
+  try {
+    const [rows] = await db.query('SELECT cfg_key, cfg_value FROM system_config ORDER BY cfg_key')
+    const cfg = {}
+    for (const r of rows) cfg[r.cfg_key] = r.cfg_value
+    return cfg
+  } catch { return {} }
+}
+async function dbSetSystemConfig(key, value) {
+  await db.query('INSERT INTO system_config (cfg_key, cfg_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE cfg_value = ?', [key, value, value])
+}
+
+// ========== 套餐管理 ==========
+async function dbGetPackages(onlyActive = false) {
+  const [rows] = await db.query(
+    onlyActive ? 'SELECT * FROM packages WHERE is_active=1 ORDER BY price ASC' : 'SELECT * FROM packages ORDER BY created_at DESC'
+  )
+  return rows
+}
+async function dbCreatePackage(name, quota, price) {
+  const [r] = await db.query('INSERT INTO packages (name, quota, price) VALUES (?, ?, ?)', [name, quota, price])
+  return r.insertId
+}
+async function dbUpdatePackage(id, name, quota, price, isActive) {
+  await db.query('UPDATE packages SET name=?, quota=?, price=?, is_active=? WHERE id=?', [name, quota, price, isActive ? 1 : 0, id])
+}
+async function dbDeletePackage(id) {
+  await db.query('DELETE FROM packages WHERE id=?', [id])
+}
+
+// ========== 订单管理 ==========
+async function dbCreateOrder(orderId, userId, packageId, amount, quota) {
+  await db.query(
+    'INSERT INTO orders (id, user_id, package_id, amount, quota, status) VALUES (?, ?, ?, ?, ?, ?)',
+    [orderId, userId, packageId, amount, quota, 'pending']
+  )
+}
+async function dbGetOrder(orderId) {
+  const [rows] = await db.query('SELECT * FROM orders WHERE id=?', [orderId])
+  return rows[0] ?? null
+}
+async function dbUpdateOrderStatus(orderId, status) {
+  if (status === 'paid') {
+    await db.query('UPDATE orders SET status=?, paid_at=NOW() WHERE id=?', [status, orderId])
+  } else {
+    await db.query('UPDATE orders SET status=? WHERE id=?', [status, orderId])
+  }
+}
+
+// ========== 额度管理 ==========
+async function dbAddQuota(userId, delta) {
+  await db.query('UPDATE users SET quota = quota + ? WHERE id = ?', [delta, userId])
+}
+async function dbDeductQuota(userId, count) {
+  await db.query('UPDATE users SET quota = GREATEST(0, quota - ?) WHERE id = ?', [count, userId])
 }
 
 // ========== BotInstance ==========
@@ -699,6 +867,19 @@ class BotInstance {
             continue
           }
 
+          // === 额度检查 ===
+          if (this.createdBy) {
+            try {
+              const [_qr] = await db.query('SELECT quota FROM users WHERE id = ?', [this.createdBy])
+              const userQuota = _qr[0]?.quota ?? 0
+              if (userQuota <= 0) {
+                const warnUrl = await dbGetSystemConfig('quota_warning_url') || 'http://wxhot.xmhwl.cn'
+                await this.sendMsgSafe(fromId, contextToken, `提示：你的宝宝额度用完啦，快来续费：${warnUrl}`)
+                continue
+              }
+            } catch (e) { console.log(`[${this.name}] 额度检查失败: ${e.message}`) }
+          }
+
           // typing_ticket
           if (!this.typingTicketCache[fromId]) {
             const cfg = await this.apiPost('ilink/bot/getconfig', {
@@ -785,6 +966,13 @@ class BotInstance {
 
           // 所有段发完后停止 typing
           if (tt) await this.apiPost('ilink/bot/sendtyping', { ilink_user_id: fromId, typing_ticket: tt, status: 2 })
+
+          // 扣除额度
+          if (this.createdBy) {
+            try {
+              await db.query('UPDATE users SET quota = GREATEST(0, quota - ?) WHERE id = ?', [segments.length, this.createdBy])
+            } catch (e) { console.log(`[${this.name}] 额度扣除失败: ${e.message}`) }
+          }
         }
       } catch (e) {
         if (!this.stopped) {
@@ -922,7 +1110,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!ok) return res.status(401).json({ error: '账号或密码错误' })
     const token = randomUUID()
     sessions.set(token, { userId: user.id, username: user.username, role: user.role })
-    res.json({ token, username: user.username, role: user.role })
+    res.json({ token, username: user.username, role: user.role, quota: user.quota ?? 0, inviteCode: user.invite_code ?? '' })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -934,8 +1122,50 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
 })
 
 // GET /api/auth/me
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  res.json({ userId: req.user.userId, username: req.user.username, role: req.user.role })
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT quota, invite_code FROM users WHERE id = ?', [req.user.userId])
+    res.json({ userId: req.user.userId, username: req.user.username, role: req.user.role, quota: rows[0]?.quota ?? 0, inviteCode: rows[0]?.invite_code ?? '' })
+  } catch {
+    res.json({ userId: req.user.userId, username: req.user.username, role: req.user.role, quota: 0, inviteCode: '' })
+  }
+})
+
+// POST /api/auth/register
+app.post('/api/auth/register', async (req, res) => {
+  const { username, password, inviteCode } = req.body
+  if (!username?.trim()) return res.status(400).json({ error: '请输入账号' })
+  if (!password?.trim()) return res.status(400).json({ error: '请输入密码' })
+  if (password.trim().length < 6) return res.status(400).json({ error: '密码不能少于6位' })
+  try {
+    const defaultQuota = parseInt(await dbGetSystemConfig('default_register_quota') || '30') || 30
+    let inviterId = null
+    if (inviteCode?.trim()) {
+      const [inviter] = await db.query('SELECT id FROM users WHERE invite_code = ?', [inviteCode.trim().toUpperCase()])
+      if (inviter[0]) inviterId = inviter[0].id
+    }
+    const hash = await bcrypt.hash(password.trim(), 10)
+    const myCode = generateInviteCode()
+    await db.query(
+      'INSERT INTO users (username, password, password_plain, role, quota, invite_code, invited_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [username.trim(), hash, password.trim(), 'user', defaultQuota, myCode, inviterId]
+    )
+    if (inviterId) {
+      await db.query('UPDATE users SET invite_count = invite_count + 1 WHERE id = ?', [inviterId])
+      const threshold   = parseInt(await dbGetSystemConfig('invite_threshold')   || '3')   || 3
+      const rewardQuota = parseInt(await dbGetSystemConfig('invite_reward_quota') || '200') || 200
+      const [inviterRow] = await db.query('SELECT invite_count FROM users WHERE id = ?', [inviterId])
+      const newCount = inviterRow[0]?.invite_count || 0
+      if (newCount % threshold === 0) {
+        await db.query('UPDATE users SET quota = quota + ? WHERE id = ?', [rewardQuota, inviterId])
+        console.log(`[邀请] 用户 ${inviterId} 达到 ${threshold} 人邀请阈值，奖励 ${rewardQuota} 额度`)
+      }
+    }
+    res.json({ ok: true })
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: '账号已存在，请换一个' })
+    res.status(500).json({ error: e.message })
+  }
 })
 
 // ========== 用户管理 API (admin only) ==========
@@ -976,6 +1206,21 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
     await dbDeleteUser(Number(req.params.id))
     res.json({ ok: true })
   } catch (e) { res.status(409).json({ error: e.message }) }
+})
+
+// POST /api/users/:id/quota [admin] — 手动调整用户额度
+app.post('/api/users/:id/quota', requireAuth, requireAdmin, async (req, res) => {
+  const { delta } = req.body
+  if (typeof delta !== 'number') return res.status(400).json({ error: 'delta 必须是数字' })
+  try {
+    if (delta >= 0) {
+      await db.query('UPDATE users SET quota = quota + ? WHERE id = ?', [delta, Number(req.params.id)])
+    } else {
+      await db.query('UPDATE users SET quota = GREATEST(0, quota + ?) WHERE id = ?', [delta, Number(req.params.id)])
+    }
+    const [rows] = await db.query('SELECT quota FROM users WHERE id = ?', [Number(req.params.id)])
+    res.json({ ok: true, quota: rows[0]?.quota ?? 0 })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 // ========== Bots API (需登录，按角色过滤) ==========
@@ -1289,6 +1534,267 @@ app.post('/api/generate-persona', requireAuth, async (req, res) => {
     if (!text) return res.status(500).json({ error: 'AI 未返回有效内容' })
     res.json({ persona: text })
   } catch (e) { res.status(500).json({ error: '请求失败: ' + e.message }) }
+})
+
+// ========== 套餐 API ==========
+app.get('/api/packages', requireAuth, async (_req, res) => {
+  try { res.json(await dbGetPackages()) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.post('/api/packages', requireAuth, requireAdmin, async (req, res) => {
+  const { name, quota, price } = req.body
+  if (!name?.trim())      return res.status(400).json({ error: '缺少套餐名称' })
+  if (!quota || quota <= 0) return res.status(400).json({ error: '额度条数必须大于0' })
+  if (!price || price <= 0) return res.status(400).json({ error: '价格必须大于0' })
+  try { res.json({ id: await dbCreatePackage(name.trim(), Number(quota), Number(price)), ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.put('/api/packages/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { name, quota, price, isActive } = req.body
+  if (!name?.trim()) return res.status(400).json({ error: '缺少套餐名称' })
+  try { await dbUpdatePackage(Number(req.params.id), name.trim(), Number(quota), Number(price), isActive !== false); res.json({ ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.delete('/api/packages/:id', requireAuth, requireAdmin, async (req, res) => {
+  try { await dbDeletePackage(Number(req.params.id)); res.json({ ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ========== 系统配置 API ==========
+app.get('/api/system-config', requireAuth, requireAdmin, async (_req, res) => {
+  try { res.json(await dbGetAllSystemConfig()) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.put('/api/system-config', requireAuth, requireAdmin, async (req, res) => {
+  const { key, value } = req.body
+  if (!key) return res.status(400).json({ error: '缺少 key' })
+  if (value === undefined || value === null) return res.status(400).json({ error: '缺少 value' })
+  try { await dbSetSystemConfig(key, String(value)); res.json({ ok: true }) }
+  catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ========== 微信支付 SDK (V2) ==========
+async function wxGetConfig() {
+  const keys = [
+    'wx_appid','wx_mchid','wx_api_key','wx_cert_serial','wx_private_key',
+    'wx_notify_url','wx_app_secret',
+    'app_id','mch_id','mch_key','key_path','notify_url',
+  ]
+  const [rows] = await db.query(
+    `SELECT cfg_key, cfg_value FROM system_config WHERE cfg_key IN (${keys.map(() => '?').join(',')})`, keys
+  )
+  const cfg = {}
+  for (const r of rows) cfg[r.cfg_key] = r.cfg_value
+  // 小程序/公众号 AppID: 优先用 app_id，备用 wx_appid
+  cfg._appid      = cfg.app_id      || cfg.wx_appid      || ''
+  cfg._mchid      = cfg.mch_id      || cfg.wx_mchid      || ''
+  cfg._mchkey     = cfg.mch_key     || ''
+  cfg._notifyUrl  = cfg.notify_url  || cfg.wx_notify_url || ''
+  cfg._appSecret  = cfg.wx_app_secret || ''
+  return cfg
+}
+
+// XML 工具函数
+function buildXml(obj) {
+  return '<xml>' + Object.entries(obj)
+    .map(([k, v]) => `<${k}><![CDATA[${v}]]></${k}>`).join('') + '</xml>'
+}
+function parseXml(xml) {
+  const result = {}
+  const re = /<(\w+)>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*?))<\/\1>/g
+  let m
+  while ((m = re.exec(xml)) !== null) result[m[1]] = m[2] !== undefined ? m[2] : m[3]
+  return result
+}
+
+// V2 签名（MD5）
+function wxV2Sign(params, key) {
+  const str = Object.keys(params).sort()
+    .filter(k => params[k] !== '' && params[k] !== undefined && params[k] !== null
+                 && k !== 'sign' && k !== 'paySign')
+    .map(k => `${k}=${params[k]}`).join('&') + '&key=' + key
+  return createHash('md5').update(str).digest('hex').toUpperCase()
+}
+
+// V2 JSAPI 统一下单
+async function createV2JsapiOrder(orderId, description, amountYuan, openid) {
+  const cfg = await wxGetConfig()
+  if (!cfg._appid || !cfg._mchid || !cfg._mchkey) {
+    throw new Error('微信支付未配置，请在系统设置中填写 app_id、mch_id、mch_key')
+  }
+  const nonceStr = randomBytes(16).toString('hex').substring(0, 32)
+  const params = {
+    appid:            cfg._appid,
+    mch_id:           cfg._mchid,
+    nonce_str:        nonceStr,
+    body:             description,
+    out_trade_no:     orderId,
+    total_fee:        String(Math.round(amountYuan * 100)),
+    spbill_create_ip: '127.0.0.1',
+    notify_url:       cfg._notifyUrl || 'http://your-domain/api/wx-pay/notify',
+    trade_type:       'JSAPI',
+    openid:           openid,
+  }
+  params.sign = wxV2Sign(params, cfg._mchkey)
+  const xml  = buildXml(params)
+  const resp = await fetch('https://api.mch.weixin.qq.com/pay/unifiedorder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
+    body: xml,
+  })
+  const text   = await resp.text()
+  const result = parseXml(text)
+  if (result.return_code !== 'SUCCESS') throw new Error(result.return_msg || '请求失败')
+  if (result.result_code !== 'SUCCESS') throw new Error(result.err_code_des || result.err_code || '下单失败')
+  return result.prepay_id
+}
+
+// V2 前端支付参数签名
+function signV2JsapiParams(appId, prepayId, mchKey) {
+  const timeStamp = String(Math.floor(Date.now() / 1000))
+  const nonceStr  = randomBytes(8).toString('hex')
+  const pkg       = `prepay_id=${prepayId}`
+  const paySign   = wxV2Sign({ appId, timeStamp, nonceStr, package: pkg, signType: 'MD5' }, mchKey)
+  return { appId, timeStamp, nonceStr, package: pkg, signType: 'MD5', paySign }
+}
+
+// JSSDK jsapi_ticket 缓存
+let _wxAccessToken = null, _wxAccessTokenExp = 0
+let _wxJsapiTicket = null, _wxJsapiTicketExp = 0
+async function wxGetAccessToken() {
+  if (_wxAccessToken && Date.now() < _wxAccessTokenExp) return _wxAccessToken
+  const cfg = await wxGetConfig()
+  if (!cfg._appid || !cfg._appSecret) throw new Error('未配置AppID或AppSecret')
+  const resp = await fetch(`https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${cfg._appid}&secret=${cfg._appSecret}`)
+  const data = await resp.json()
+  if (data.errcode) throw new Error(`获取access_token失败: ${data.errmsg}`)
+  _wxAccessToken    = data.access_token
+  _wxAccessTokenExp = Date.now() + (data.expires_in - 300) * 1000
+  return _wxAccessToken
+}
+async function wxGetJsapiTicket() {
+  if (_wxJsapiTicket && Date.now() < _wxJsapiTicketExp) return _wxJsapiTicket
+  const token = await wxGetAccessToken()
+  const resp  = await fetch(`https://api.weixin.qq.com/cgi-bin/ticket/getticket?access_token=${token}&type=jsapi`)
+  const data  = await resp.json()
+  if (data.errcode !== 0) throw new Error(`获取jsapi_ticket失败: ${data.errmsg}`)
+  _wxJsapiTicket    = data.ticket
+  _wxJsapiTicketExp = Date.now() + (data.expires_in - 300) * 1000
+  return _wxJsapiTicket
+}
+
+// ========== 微信OAuth + JSSDK 配置 ==========
+// GET /api/wx-oauth/url — 生成OAuth授权URL
+app.get('/api/wx-oauth/url', requireAuth, async (req, res) => {
+  try {
+    const cfg = await wxGetConfig()
+    if (!cfg._appid) return res.status(400).json({ error: '未配置微信AppID（app_id）' })
+    const redirectUri = encodeURIComponent(req.query.redirect || `${req.protocol}://${req.get('host')}`)
+    const url = `https://open.weixin.qq.com/connect/oauth2/authorize?appid=${cfg._appid}&redirect_uri=${redirectUri}&response_type=code&scope=snsapi_base&state=pay#wechat_redirect`
+    res.json({ url })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+// POST /api/wx-oauth/exchange — code换openid
+app.post('/api/wx-oauth/exchange', requireAuth, async (req, res) => {
+  const { code } = req.body
+  if (!code) return res.status(400).json({ error: '缺少code' })
+  try {
+    const cfg  = await wxGetConfig()
+    const resp = await fetch(`https://api.weixin.qq.com/sns/oauth2/access_token?appid=${cfg._appid}&secret=${cfg._appSecret}&code=${code}&grant_type=authorization_code`)
+    const data = await resp.json()
+    if (data.errcode) return res.status(400).json({ error: `获取openid失败: ${data.errmsg}` })
+    await db.query('UPDATE users SET openid = ? WHERE id = ?', [data.openid, req.user.userId])
+    res.json({ openid: data.openid })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+// GET /api/wx-jssdk-config — 获取JSSDK签名配置
+app.get('/api/wx-jssdk-config', requireAuth, async (req, res) => {
+  const url = req.query.url
+  if (!url) return res.status(400).json({ error: '缺少url' })
+  try {
+    const cfg    = await wxGetConfig()
+    const ticket = await wxGetJsapiTicket()
+    const nonce  = randomBytes(8).toString('hex')
+    const ts     = String(Math.floor(Date.now() / 1000))
+    const str    = `jsapi_ticket=${ticket}&noncestr=${nonce}&timestamp=${ts}&url=${url}`
+    const sig    = createHash('sha1').update(str).digest('hex')
+    res.json({ appId: cfg._appid, nonceStr: nonce, timestamp: ts, signature: sig })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ========== 订单 API ==========
+// POST /api/orders — 用户下单
+app.post('/api/orders', requireAuth, async (req, res) => {
+  const { packageId, openid } = req.body
+  if (!packageId) return res.status(400).json({ error: '缺少 packageId' })
+  if (!openid)    return res.status(400).json({ error: '缺少微信openid，请在微信中打开此页面进行支付' })
+  try {
+    const [pkgRows] = await db.query('SELECT * FROM packages WHERE id = ? AND is_active = 1', [Number(packageId)])
+    const pkg = pkgRows[0]
+    if (!pkg) return res.status(404).json({ error: '套餐不存在或已下架' })
+    const orderId = randomUUID().replace(/-/g, '').substring(0, 32)
+    let jsapiParams = null
+    try {
+      const prepayId = await createV2JsapiOrder(orderId, pkg.name, Number(pkg.price), openid)
+      const cfg      = await wxGetConfig()
+      jsapiParams    = signV2JsapiParams(cfg._appid, prepayId, cfg._mchkey)
+    } catch (e) { console.log('[WxPay V2] 下单失败:', e.message) }
+    await dbCreateOrder(orderId, req.user.userId, pkg.id, pkg.price, pkg.quota)
+    res.json({ orderId, jsapiParams, amount: pkg.price, quota: pkg.quota, name: pkg.name })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// GET /api/orders/:id — 查询订单状态
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
+  try {
+    const order = await dbGetOrder(req.params.id)
+    if (!order) return res.status(404).json({ error: '订单不存在' })
+    if (order.user_id !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: '无权查看此订单' })
+    }
+    res.json({ id: order.id, status: order.status, amount: order.amount, quota: order.quota, paid_at: order.paid_at })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// POST /api/wx-pay/notify — 微信支付V2 XML回调
+app.post('/api/wx-pay/notify', express.text({ type: '*/*', limit: '1mb' }), async (req, res) => {
+  const xmlReply = (code, msg) =>
+    `<xml><return_code><![CDATA[${code}]]></return_code><return_msg><![CDATA[${msg}]]></return_msg></xml>`
+  try {
+    const xmlBody = typeof req.body === 'string' ? req.body : ''
+    if (!xmlBody) return res.type('xml').send(xmlReply('FAIL', '无效通知'))
+
+    const params = parseXml(xmlBody)
+
+    // MD5 验签
+    const cfg = await wxGetConfig()
+    if (cfg._mchkey) {
+      const received = params.sign
+      const computed = wxV2Sign(params, cfg._mchkey)
+      if (received !== computed) {
+        console.error('[WxPay V2] 签名验证失败', { received, computed })
+        return res.type('xml').send(xmlReply('FAIL', '签名验证失败'))
+      }
+    }
+
+    if (params.return_code !== 'SUCCESS' || params.result_code !== 'SUCCESS') {
+      console.log('[WxPay V2] 商户处理失败:', params.err_code_des || params.return_msg)
+      return res.type('xml').send(xmlReply('SUCCESS', 'OK'))
+    }
+
+    const orderId = params.out_trade_no
+    const order   = await dbGetOrder(orderId)
+    if (!order) return res.type('xml').send(xmlReply('FAIL', '订单不存在'))
+    if (order.status === 'paid') return res.type('xml').send(xmlReply('SUCCESS', 'OK'))
+
+    await dbUpdateOrderStatus(orderId, 'paid')
+    await db.query('UPDATE users SET quota = quota + ? WHERE id = ?', [order.quota, order.user_id])
+    console.log(`[WxPay V2] 订单 ${orderId} 支付成功，用户 ${order.user_id} 增加 ${order.quota} 额度`)
+    res.type('xml').send(xmlReply('SUCCESS', 'OK'))
+  } catch (e) {
+    console.error('[WxPay V2] 回调处理失败:', e.message)
+    res.type('xml').send(xmlReply('FAIL', e.message))
+  }
 })
 
 // SPA fallback

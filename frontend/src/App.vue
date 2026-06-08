@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { Plus, Search, Bot as BotIcon, BookOpen, Cpu, Users, LogOut, Sparkles, Menu, X } from 'lucide-vue-next'
+import { Plus, Search, Bot as BotIcon, BookOpen, Cpu, Users, LogOut, Sparkles, Menu, X, Package, Settings, ShoppingCart, Gift } from 'lucide-vue-next'
 import { apiUrl } from './lib/api'
 import StatCard from './components/StatCard.vue'
 import BotCard, { type Bot, type BotStatus } from './components/BotCard.vue'
@@ -11,13 +11,18 @@ import PersonasModal from './components/PersonasModal.vue'
 import AIProvidersModal from './components/AIProvidersModal.vue'
 import UsersModal from './components/UsersModal.vue'
 import PromptTemplatesModal from './components/PromptTemplatesModal.vue'
+import PackagesModal from './components/PackagesModal.vue'
+import SystemConfigModal from './components/SystemConfigModal.vue'
+import QuotaShopModal from './components/QuotaShopModal.vue'
 import LoginPage from './components/LoginPage.vue'
 
 // -------- Auth --------
-const authToken    = ref(localStorage.getItem('clawbot_token') ?? '')
-const authUsername = ref(localStorage.getItem('clawbot_username') ?? '')
-const authRole     = ref(localStorage.getItem('clawbot_role') ?? '')
-const isLoggedIn   = computed(() => !!authToken.value)
+const authToken     = ref(localStorage.getItem('clawbot_token') ?? '')
+const authUsername  = ref(localStorage.getItem('clawbot_username') ?? '')
+const authRole      = ref(localStorage.getItem('clawbot_role') ?? '')
+const authQuota     = ref(Number(localStorage.getItem('clawbot_quota') ?? 0))
+const authInviteCode = ref(localStorage.getItem('clawbot_invite_code') ?? '')
+const isLoggedIn    = computed(() => !!authToken.value)
 
 function apiFetch(url: string, init: RequestInit = {}) {
   return fetch(apiUrl(url), {
@@ -30,23 +35,31 @@ function apiFetch(url: string, init: RequestInit = {}) {
   })
 }
 
-function handleLogin({ token, username, role }: { token: string; username: string; role: string }) {
-  authToken.value    = token
-  authUsername.value = username
-  authRole.value     = role
-  localStorage.setItem('clawbot_token',    token)
-  localStorage.setItem('clawbot_username', username)
-  localStorage.setItem('clawbot_role',     role)
+function handleLogin({ token, username, role, quota, inviteCode }: { token: string; username: string; role: string; quota?: number; inviteCode?: string }) {
+  authToken.value      = token
+  authUsername.value   = username
+  authRole.value       = role
+  authQuota.value      = quota ?? 0
+  authInviteCode.value = inviteCode ?? ''
+  localStorage.setItem('clawbot_token',       token)
+  localStorage.setItem('clawbot_username',    username)
+  localStorage.setItem('clawbot_role',        role)
+  localStorage.setItem('clawbot_quota',       String(quota ?? 0))
+  localStorage.setItem('clawbot_invite_code', inviteCode ?? '')
 }
 
 async function handleLogout() {
   try { await apiFetch('/api/auth/logout', { method: 'POST' }) } catch {}
-  authToken.value    = ''
-  authUsername.value = ''
-  authRole.value     = ''
+  authToken.value      = ''
+  authUsername.value   = ''
+  authRole.value       = ''
+  authQuota.value      = 0
+  authInviteCode.value = ''
   localStorage.removeItem('clawbot_token')
   localStorage.removeItem('clawbot_username')
   localStorage.removeItem('clawbot_role')
+  localStorage.removeItem('clawbot_quota')
+  localStorage.removeItem('clawbot_invite_code')
   bots.value = []
 }
 
@@ -59,6 +72,12 @@ async function verifySession() {
       localStorage.removeItem('clawbot_token')
       localStorage.removeItem('clawbot_username')
       localStorage.removeItem('clawbot_role')
+    } else {
+      const data = await res.json()
+      authQuota.value      = data.quota ?? 0
+      authInviteCode.value = data.inviteCode ?? ''
+      localStorage.setItem('clawbot_quota',       String(data.quota ?? 0))
+      localStorage.setItem('clawbot_invite_code', data.inviteCode ?? '')
     }
   } catch {}
 }
@@ -98,6 +117,9 @@ const personasOpen       = ref(false)
 const aiProvidersOpen    = ref(false)
 const usersOpen          = ref(false)
 const promptTplOpen      = ref(false)
+const packagesOpen       = ref(false)
+const systemConfigOpen   = ref(false)
+const quotaShopOpen      = ref(false)
 const menuOpen           = ref(false)   // 手机端汉堡菜单
 
 function openMenu(fn: () => void) {
@@ -134,6 +156,27 @@ onMounted(async () => {
   await verifySession()
   fetchBots()
   pollTimer = setInterval(fetchBots, 2000)
+
+  // 处理微信 OAuth 回调中的 code
+  if (isLoggedIn.value) {
+    const params = new URLSearchParams(window.location.search)
+    const code   = params.get('code')
+    const state  = params.get('state')
+    if (code && state === 'pay') {
+      try {
+        const res  = await apiFetch('/api/wx-oauth/exchange', {
+          method: 'POST', body: JSON.stringify({ code }),
+        })
+        const data = await res.json()
+        if (data.openid) localStorage.setItem('wx_openid', data.openid)
+      } catch {}
+      // 清理 URL 中的 code 参数
+      const cleanUrl = window.location.pathname + window.location.hash
+      window.history.replaceState({}, '', cleanUrl)
+      // 自动打开购买额度弹窗
+      setTimeout(() => { quotaShopOpen.value = true }, 300)
+    }
+  }
 })
 onUnmounted(() => clearInterval(pollTimer))
 
@@ -184,6 +227,11 @@ async function handleDelete(bot: Bot) {
 async function handleSave({ id, persona }: { id: string; persona: string }) {
   bots.value = bots.value.map(b => b.id === id ? { ...b, persona } : b)
 }
+
+function handleQuotaUpdated(q: number) {
+  authQuota.value = q
+  localStorage.setItem('clawbot_quota', String(q))
+}
 </script>
 
 <template>
@@ -208,7 +256,7 @@ async function handleSave({ id, persona }: { id: string; persona: string }) {
           </div>
         </div>
 
-        <!-- 桌面端：管理按钮组 (sm+) -->
+        <!-- 桌面端：管理按鈕组 (sm+) -->
         <div v-if="authRole === 'admin'" class="hidden sm:flex items-center gap-1.5">
           <button class="lib-btn" @click="usersOpen = true">
             <Users :size="14" /> 用户管理
@@ -222,22 +270,33 @@ async function handleSave({ id, persona }: { id: string; persona: string }) {
           <button class="lib-btn" @click="promptTplOpen = true">
             <Sparkles :size="14" /> 提示词库
           </button>
+          <button class="lib-btn" @click="packagesOpen = true">
+            <Package :size="14" /> 套餐管理
+          </button>
+          <button class="lib-btn" @click="systemConfigOpen = true">
+            <Settings :size="14" /> 系统设置
+          </button>
         </div>
 
         <!-- 右侧：用户信息 + 操作 -->
         <div class="flex items-center gap-1.5 shrink-0">
+          <!-- 额度显示 -->
+          <button v-if="authRole !== 'admin'" class="quota-badge" @click="quotaShopOpen = true" title="购买额度">
+            <Gift :size="12" />额度：{{ authQuota }}
+          </button>
+          <span v-else class="hidden sm:inline text-[12px] text-[#86909C]">额度: {{ authQuota }}</span>
           <!-- 用户名 + 角色（仅 sm+ 显示用户名） -->
           <span class="hidden sm:inline text-[13px] text-[#4E5969]">{{ authUsername }}</span>
           <span class="role-tag" :class="authRole">{{ authRole === 'admin' ? '管理员' : '用户' }}</span>
-
-          <!-- 手机端汉堡菜单按钮（admin 才显示） -->
+        
+          <!-- 手机端汉堡菜单按鈕（admin 才显示） -->
           <button v-if="authRole === 'admin'"
             class="menu-btn sm:hidden"
             @click="menuOpen = !menuOpen">
             <X v-if="menuOpen" :size="18" />
             <Menu v-else :size="18" />
           </button>
-
+        
           <!-- 登出 -->
           <button class="logout-btn" title="退出登录" @click="handleLogout">
             <LogOut :size="15" />
@@ -264,6 +323,14 @@ async function handleSave({ id, persona }: { id: string; persona: string }) {
           <button class="mobile-menu-item" @click="openMenu(() => promptTplOpen = true)">
             <Sparkles :size="16" style="color:#7B61FF" />
             <span>提示词库</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => packagesOpen = true)">
+            <Package :size="16" style="color:#4080FF" />
+            <span>套餐管理</span>
+          </button>
+          <button class="mobile-menu-item" @click="openMenu(() => systemConfigOpen = true)">
+            <Settings :size="16" style="color:#4E5969" />
+            <span>系统设置</span>
           </button>
         </div>
       </Transition>
@@ -326,6 +393,12 @@ async function handleSave({ id, persona }: { id: string; persona: string }) {
     <AIProvidersModal    :open="aiProvidersOpen" @update:open="aiProvidersOpen = $event" />
     <UsersModal          :open="usersOpen"       :token="authToken" @update:open="usersOpen = $event" />
     <PromptTemplatesModal :open="promptTplOpen"  :token="authToken" @update:open="promptTplOpen = $event" />
+    <PackagesModal       :open="packagesOpen"    :token="authToken" @update:open="packagesOpen = $event" />
+    <SystemConfigModal   :open="systemConfigOpen" :token="authToken" @update:open="systemConfigOpen = $event" />
+    <QuotaShopModal      :open="quotaShopOpen"   :token="authToken"
+      @update:open="quotaShopOpen = $event"
+      @quota-updated="handleQuotaUpdated"
+    />
     <CreateBotModal      :open="createOpen"      :token="authToken"
       @update:open="createOpen = $event" @create="handleCreate" />
     <QrCodeModal         :open="!!qrBot"         :bot="qrBot"
@@ -369,6 +442,16 @@ async function handleSave({ id, persona }: { id: string; persona: string }) {
 }
 .role-tag.admin { background:rgba(64,128,255,.12); color:#4080FF; }
 .role-tag.user  { background:rgba(134,144,156,.12); color:#86909C; }
+
+.quota-badge {
+  display:inline-flex; align-items:center; gap:4px;
+  height:26px; padding:0 10px; border-radius:20px;
+  background:rgba(64,128,255,.10); color:#4080FF;
+  border:1px solid rgba(64,128,255,.2);
+  font-size:11px; font-weight:500; cursor:pointer; white-space:nowrap;
+  transition:all .15s;
+}
+.quota-badge:hover { background:rgba(64,128,255,.18); }
 
 .logout-btn {
   width:32px; height:32px; border-radius:8px; background:transparent; border:none;
